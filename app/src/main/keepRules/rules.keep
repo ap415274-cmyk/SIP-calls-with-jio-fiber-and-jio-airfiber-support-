@@ -1,0 +1,13 @@
+# Keep Android app entry points, receivers, services, and data models
+-keep class com.pp.jiocall.MainActivity { *; }
+-keep class com.pp.jiocall.App { *; }
+-keep class com.pp.jiocall.sip.CallService { *; }
+-keep class com.pp.jiocall.sip.CallActionReceiver { *; }
+-keep class com.pp.jiocall.sip.BootReceiver { *; }
+-keep class com.pp.jiocall.ui.AppViewModel { *; }
+-keepattributes Signature,InnerClasses,EnclosingMethod
+-keepclassmembers class * extends java.lang.Enum {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
+-dontwarn kotlinx.coroutines.**

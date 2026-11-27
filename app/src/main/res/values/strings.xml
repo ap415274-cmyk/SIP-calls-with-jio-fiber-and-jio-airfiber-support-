@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Jio call</string>
+    <string name="call_channel_name">Calls</string>
+    <string name="call_channel_description">Ongoing and incoming calls</string>
+</resources>

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Google Phone App Dark Theme Palette -->
+    <color name="window_background">#FF121316</color>
+    <color name="ic_launcher_background">#FF121316</color>
+
+    <!-- Surfaces & Backgrounds -->
+    <color name="google_bg_dark">#FF121316</color>
+    <color name="google_surface_dark">#FF1A1C1E</color>
+    <color name="google_surface_container">#FF212429</color>
+    <color name="google_surface_container_high">#FF282B30</color>
+    <color name="google_surface_container_highest">#FF31343A</color>
+    <color name="google_surface_variant">#FF2A2C31</color>
+    <color name="google_call_bg">#FF0F1115</color>
+
+    <!-- Material You Accent (Google Blue / Cyan) -->
+    <color name="google_primary">#FFA8C7FA</color>
+    <color name="google_on_primary">#FF042B63</color>
+    <color name="google_primary_container">#FF1C3B6B</color>
+    <color name="google_on_primary_container">#FFD3E3FD</color>
+    <color name="google_secondary">#FF7FCFFF</color>
+    <color name="google_secondary_container">#FF004B73</color>
+
+    <!-- Call Action Colors -->
+    <color name="google_call_end">#FFE53935</color>
+    <color name="google_call_end_pressed">#FFC62828</color>
+    <color name="google_call_answer">#FF34A853</color>
+    <color name="google_call_answer_pressed">#FF2E7D32</color>
+
+    <!-- Active & Inactive Button Tints -->
+    <color name="google_btn_inactive">#FF2D3139</color>
+    <color name="google_btn_inactive_border">#FF3C4049</color>
+    <color name="google_btn_active">#FFA8C7FA</color>
+    <color name="google_btn_active_content">#FF042B63</color>
+
+    <!-- Typography Colors -->
+    <color name="google_text_primary">#FFE3E3E3</color>
+    <color name="google_text_secondary">#FFC4C7C5</color>
+    <color name="google_text_tertiary">#FF8E918F</color>
+
+    <!-- Dividers & Outlines -->
+    <color name="google_outline">#FF44474E</color>
+    <color name="google_outline_variant">#FF2F333A</color>
+</resources>
