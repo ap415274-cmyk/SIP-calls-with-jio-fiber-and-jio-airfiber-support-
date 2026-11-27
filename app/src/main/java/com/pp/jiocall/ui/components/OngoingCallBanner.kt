@@ -119,7 +119,7 @@ fun OngoingCallBanner(
     Surface(
         shape = RoundedCornerShape(22.dp),
         color = Color.Transparent,
-        shadowElevation = 6.dp,
+        shadowElevation = 0.dp,
         modifier = modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 6.dp)

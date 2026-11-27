@@ -78,7 +78,7 @@ fun IncomingSlideControlBar(
     modifier: Modifier = Modifier,
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "incomingHandlePulse")
-    val idleRingProgress by infiniteTransition.animateFloat(
+    val idleRingState = infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
@@ -101,7 +101,7 @@ fun IncomingSlideControlBar(
             slideHint = "Slide to decline",
             baseColor = Color(0xFFE53935),
             glowColor = Color(0xFFF28B82),
-            idleRingProgressProvider = { idleRingProgress },
+            idleRingProgressProvider = { idleRingState.value },
             onTrigger = onDecline,
             modifier = Modifier.weight(1f),
         )
@@ -111,7 +111,7 @@ fun IncomingSlideControlBar(
             slideHint = "Slide to answer",
             baseColor = Color(0xFF2EB857),
             glowColor = Color(0xFF81C995),
-            idleRingProgressProvider = { idleRingProgress },
+            idleRingProgressProvider = { idleRingState.value },
             onTrigger = onAnswer,
             modifier = Modifier.weight(1f),
         )
@@ -356,7 +356,7 @@ fun OneUiIncomingAvatarHalo(
     modifier: Modifier = Modifier,
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "avatarHaloPulse")
-    val p1 by infiniteTransition.animateFloat(
+    val p1State = infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
@@ -365,7 +365,7 @@ fun OneUiIncomingAvatarHalo(
         ),
         label = "halo1",
     )
-    val p2 by infiniteTransition.animateFloat(
+    val p2State = infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
@@ -375,6 +375,8 @@ fun OneUiIncomingAvatarHalo(
         label = "halo2",
     )
     Canvas(modifier = modifier) {
+        val p1 = p1State.value
+        val p2 = p2State.value
         val center = Offset(size.width / 2f, size.height / 2f)
         val innerR = size.minDimension * 0.34f
         val maxR = size.minDimension * 0.49f

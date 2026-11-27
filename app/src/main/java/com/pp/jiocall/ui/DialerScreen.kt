@@ -125,25 +125,25 @@ fun DialerScreen(
         enabledAccounts.firstOrNull { it.id == selectedAccountId } ?: enabledAccounts.firstOrNull()
     }
 
-    // Never block keypad taps: run SmartDial on Dispatchers.Default while keeping zero-flicker list state.
-    val idleMatches = remember(contactLookup, contacts, isDark) {
-        if (contactLookup != null) {
-            if (isDark) contactLookup.precomputedMatchesDark else contactLookup.precomputedMatchesLight
-        } else {
-            emptyList()
+    // Fast synchronous lookup for typical phonebooks avoids double-recompose per keystroke;
+    // large phonebooks (>150 contacts) keep background computation cleanly off the UI thread.
+    val syncMatches = remember(number, contacts, isDark, contactLookup) {
+        when {
+            number.isEmpty() && contactLookup != null ->
+                if (isDark) contactLookup.precomputedMatchesDark else contactLookup.precomputedMatchesLight
+            contacts.size <= 150 -> SmartDial.search(contacts, number, isDark)
+            else -> null
         }
     }
-    var matches by remember { mutableStateOf(idleMatches) }
+    var asyncMatches by remember { mutableStateOf<List<SmartDial.ContactMatch>>(emptyList()) }
     LaunchedEffect(number, contacts, isDark, contactLookup) {
-        if (number.isEmpty() && contactLookup != null) {
-            matches = if (isDark) contactLookup.precomputedMatchesDark else contactLookup.precomputedMatchesLight
-        } else {
-            val computed = withContext(Dispatchers.Default) {
+        if (syncMatches == null) {
+            asyncMatches = withContext(Dispatchers.Default) {
                 SmartDial.search(contacts, number, isDark)
             }
-            matches = computed
         }
     }
+    val matches = syncMatches ?: asyncMatches
 
     val regStatus = remember(accounts, statuses, isDark) {
         GooglePhoneColors.getRegistrationUiStatus(accounts, statuses, isDark)
@@ -538,38 +538,24 @@ fun DialerScreen(
 
                 Spacer(Modifier.height(6.dp))
 
-                // 3x4 Keypad Grid with 120Hz RenderThread Ripple (0 Compose animation overhead on key tap)
-                DialpadGrid.forEach { row ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 3.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        row.forEach { (digit, letters) ->
-                            GooglePillKey(
-                                digit = digit,
-                                subtext = letters,
-                                modifier = Modifier.weight(1f),
-                                onPress = { number += digit },
-                                onLongPress = when (digit) {
-                                    "0" -> {
-                                        {
-                                            when {
-                                                number.isEmpty() -> number = "+"
-                                                number == "0" -> number = "+"
-                                                number.last() == '*' || number.last() == '#' -> number += "+"
-                                            }
-                                        }
-                                    }
-                                    "1" -> onDialVoicemail?.let { vm -> { vm(selectedAccount?.id) } }
-                                    else -> null
-                                },
-                                isDark = isDark,
-                            )
+                // 3x4 Keypad Grid with 120Hz RenderThread Ripple (stable callbacks skip recomposing unchanged keys)
+                val selectedAccId = selectedAccount?.id
+                DialpadGridSection(
+                    isDark = isDark,
+                    onDigitClick = remember { { digit -> number += digit } },
+                    onLongZero = remember {
+                        {
+                            when {
+                                number.isEmpty() -> number = "+"
+                                number == "0" -> number = "+"
+                                number.last() == '*' || number.last() == '#' -> number += "+"
+                            }
                         }
-                    }
-                }
+                    },
+                    onLongOne = remember(onDialVoicemail, selectedAccId) {
+                        onDialVoicemail?.let { vm -> { vm(selectedAccId) } }
+                    },
+                )
 
                 Spacer(Modifier.height(10.dp))
 
@@ -718,6 +704,38 @@ private fun GooglePillKey(
                     fontWeight = FontWeight.SemiBold,
                     color = if (isDark) GooglePhoneColors.highlight(isDark) else GooglePhoneColors.TextMuted,
                     letterSpacing = 1.sp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DialpadGridSection(
+    isDark: Boolean,
+    onDigitClick: (String) -> Unit,
+    onLongZero: () -> Unit,
+    onLongOne: (() -> Unit)?,
+) {
+    DialpadGrid.forEach { row ->
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            row.forEach { (digit, letters) ->
+                GooglePillKey(
+                    digit = digit,
+                    subtext = letters,
+                    modifier = Modifier.weight(1f),
+                    onPress = remember(onDigitClick, digit) { { onDigitClick(digit) } },
+                    onLongPress = when (digit) {
+                        "0" -> onLongZero
+                        "1" -> onLongOne
+                        else -> null
+                    },
+                    isDark = isDark,
                 )
             }
         }

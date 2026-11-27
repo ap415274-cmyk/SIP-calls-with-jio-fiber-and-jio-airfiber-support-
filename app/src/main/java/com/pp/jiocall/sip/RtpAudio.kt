@@ -51,7 +51,7 @@ class RtpAudio(
     private var txCodec: Codec = Codec.AMR_WB
     private var txPayloadType: Int = 96
     private var txOctetAligned: Boolean = false
-    private var txEncoder: AmrEncoder? = null
+    @Volatile private var txEncoder: AmrEncoder? = null
     private var rxPayloadMap: Map<Int, Codec> = emptyMap()
     private var rxOctetAlignedMap: Map<Int, Boolean> = emptyMap()
 
@@ -200,19 +200,31 @@ class RtpAudio(
         this.lastTxPeak = 0
         this.startedAtMs.set(System.currentTimeMillis())
 
+        // Pre-warm Codec2 encoder concurrently while AudioManager switches to MODE_IN_COMMUNICATION
+        // and playback AudioTrack initializes, avoiding serialized startup stalls.
+        val encoderInitThread = if (codec.isAmr) {
+            Thread({
+                val created = runCatching { AmrEncoder(codec, modeSet) }
+                    .onFailure { Log.e(TAG, "Failed creating TX ${codec.mime} encoder: ${it.message}") }
+                    .getOrNull()
+                synchronized(txLock) {
+                    if (running.get()) {
+                        txEncoder = created
+                    } else {
+                        runCatching { created?.release() }
+                    }
+                }
+            }, "JioCall-TX-EncInit").apply { start() }
+        } else {
+            txEncoder = null
+            null
+        }
+
         val ctrl = audioController ?: CallAudioController(context).also {
             audioController = it
             it.acquireSession(speakerphone)
         }
         ctrl.setSpeaker(speakerphone)
-
-        if (codec.isAmr) {
-            txEncoder = runCatching { AmrEncoder(codec, modeSet) }
-                .onFailure { Log.e(TAG, "Failed creating TX ${codec.mime} encoder: ${it.message}") }
-                .getOrNull()
-        } else {
-            txEncoder = null
-        }
 
         // Send symmetric-RTP hole-punch packet immediately so SBC opens NAT pinhole cleanly
         sendHolePunchPackets(resolved, remotePort, codec, payloadType, octetAligned)
@@ -227,17 +239,20 @@ class RtpAudio(
         ).also { playbackEngine = it }
         playback.start()
 
-        // Start UDP receiver thread
+        // Start UDP receiver thread without starving UI RenderThread on CPU-constrained devices
         rxThread = Thread(::receiveLoop, "JioCall-RTP-RX").apply {
-            priority = Thread.MAX_PRIORITY
+            priority = Thread.NORM_PRIORITY + 2
             start()
+        }
+
+        if (encoderInitThread != null) {
+            runCatching { encoderInitThread.join(2_000L) }
         }
 
         // Start dedicated TX encode/send thread decoupled from AudioRecord HAL read thread
         txFrameQueue.clear()
         txFreeQueue.clear()
         txThread = Thread(::encodeAndSendLoop, "JioCall-TX-Encode").apply {
-            priority = Thread.MAX_PRIORITY
             start()
         }
 
@@ -400,13 +415,17 @@ class RtpAudio(
     }
 
     private fun encodeAndSendLoop() {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
         val rtpBuf = ByteArray(1500)
         val rtpPkt = DatagramPacket(rtpBuf, rtpBuf.size)
+        var g711Buf = ByteArray(160)
         while (running.get()) {
             val item = runCatching { txFrameQueue.poll(40L, TimeUnit.MILLISECONDS) }.getOrNull() ?: continue
             try {
-                processAndSendFrame(item.pcm, item.muted, rtpBuf, rtpPkt)
+                if (g711Buf.size != item.pcm.size) {
+                    g711Buf = ByteArray(item.pcm.size)
+                }
+                processAndSendFrame(item.pcm, item.muted, rtpBuf, rtpPkt, g711Buf)
             } finally {
                 txFreeQueue.offer(item.pcm)
             }
@@ -418,6 +437,7 @@ class RtpAudio(
         isMutedFrame: Boolean,
         rtpBuf: ByteArray,
         rtpPkt: DatagramPacket,
+        g711Buf: ByteArray,
     ) {
         if (!running.get()) return
         val addr = remoteAddr ?: return
@@ -428,33 +448,47 @@ class RtpAudio(
             lastTxPeak = maxOf(lastTxPeak, AudioGain.peakAmplitude(pcm))
         }
 
-        val payloads: List<ByteArray> = when (txCodec) {
+        when (txCodec) {
             Codec.AMR_WB, Codec.AMR_NB -> {
                 val frames = synchronized(txLock) { txEncoder?.encodeFrames(pcm).orEmpty() }
-                frames.map { frame ->
-                    if (txOctetAligned) {
+                for (i in frames.indices) {
+                    val frame = frames[i]
+                    val payload = if (txOctetAligned) {
                         AmrFraming.toOctetAligned(frame)
                     } else {
                         AmrFraming.toBandwidthEfficient(frame, txCodec == Codec.AMR_WB)
                     }
+                    emitTxPayload(addr, targetPort, payload, rtpBuf, rtpPkt)
                 }
             }
-            Codec.PCMA -> listOf(ByteArray(pcm.size).also { G711Codec.encodeAlaw(pcm, it) })
-            Codec.PCMU -> listOf(ByteArray(pcm.size).also { G711Codec.encodeUlaw(pcm, it) })
+            Codec.PCMA -> {
+                G711Codec.encodeAlaw(pcm, g711Buf)
+                emitTxPayload(addr, targetPort, g711Buf, rtpBuf, rtpPkt)
+            }
+            Codec.PCMU -> {
+                G711Codec.encodeUlaw(pcm, g711Buf)
+                emitTxPayload(addr, targetPort, g711Buf, rtpBuf, rtpPkt)
+            }
         }
+    }
 
-        for (payload in payloads) {
-            val ts: Long
-            synchronized(txLock) {
-                ts = txTimestamp
-                txTimestamp = (txTimestamp + txCodec.samplesPerFrame) and 0xFFFF_FFFFL
-            }
-            val count = packetsTx.incrementAndGet()
-            sendRtpPacket(addr, targetPort, txPayloadType, ts, payload, marker = count == 1L, rtpBuf = rtpBuf, rtpPkt = rtpPkt)
-            if (count <= 2L || count % 250L == 0L) {
-                Log.i(TAG, "TX RTP: $count pkts (${txCodec.mime}, oa=$txOctetAligned, maxAmp=$lastTxPeak) -> $addr:$targetPort")
-                lastTxPeak = 0
-            }
+    private fun emitTxPayload(
+        addr: InetAddress,
+        targetPort: Int,
+        payload: ByteArray,
+        rtpBuf: ByteArray,
+        rtpPkt: DatagramPacket,
+    ) {
+        val ts: Long
+        synchronized(txLock) {
+            ts = txTimestamp
+            txTimestamp = (txTimestamp + txCodec.samplesPerFrame) and 0xFFFF_FFFFL
+        }
+        val count = packetsTx.incrementAndGet()
+        sendRtpPacket(addr, targetPort, txPayloadType, ts, payload, marker = count == 1L, rtpBuf = rtpBuf, rtpPkt = rtpPkt)
+        if (count <= 2L || count % 250L == 0L) {
+            Log.i(TAG, "TX RTP: $count pkts (${txCodec.mime}, oa=$txOctetAligned, maxAmp=$lastTxPeak) -> $addr:$targetPort")
+            lastTxPeak = 0
         }
     }
 

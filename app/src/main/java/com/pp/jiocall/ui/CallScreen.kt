@@ -3,16 +3,13 @@ package com.pp.jiocall.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateColor
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.updateTransition
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -55,7 +52,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -139,11 +136,6 @@ fun CallScreen(
         showKeypad = false
     }
 
-    LaunchedEffect(call.callId, showKeypad) {
-        focusManager.clearFocus(force = true)
-        keyboardController?.hide()
-    }
-
     LaunchedEffect(call.startedAt, call.state) {
         while (call.state == CallState.ACTIVE || call.state == CallState.HELD) {
             elapsedSeconds = if (call.startedAt > 0) (System.currentTimeMillis() - call.startedAt) / 1000 else 0
@@ -159,17 +151,25 @@ fun CallScreen(
     val isCallActive = call.answered && call.state == CallState.ACTIVE
     val showControls = call.answered || (call.outgoing && (call.state == CallState.DIALING || call.state == CallState.RINGING))
 
-    val glowColor by animateColorAsState(
-        targetValue = when {
-            isIncomingRinging -> Color(0x3034A853)
-            call.state == CallState.HELD -> Color(0x28FFB74D)
-            call.state == CallState.ACTIVE -> Color(0x221B72E8)
-            call.state == CallState.FAILED -> Color(0x28E53935)
-            else -> Color(0x208AB4F8)
-        },
-        animationSpec = tween(400),
-        label = "ambientGlow",
-    )
+    val glowColor = when {
+        isIncomingRinging -> Color(0x2834A853)
+        call.state == CallState.HELD -> Color(0x24FFB74D)
+        call.state == CallState.ACTIVE -> Color(0x1E1B72E8)
+        call.state == CallState.FAILED -> Color(0x24E53935)
+        else -> Color(0x1C8AB4F8)
+    }
+    val screenBgBrush = remember {
+        Brush.verticalGradient(
+            colors = listOf(
+                Color(0xFF171C24),
+                Color(0xFF0E1117),
+                Color(0xFF080A0E),
+            ),
+        )
+    }
+    val ambientGlowBrush = remember(glowColor) {
+        Brush.radialGradient(colors = listOf(glowColor, Color.Transparent))
+    }
 
     val backdropInteraction = remember { MutableInteractionSource() }
     Box(
@@ -179,27 +179,14 @@ fun CallScreen(
                 focusManager.clearFocus(force = true)
                 keyboardController?.hide()
             }
-            .background(
-                Brush.verticalGradient(
-                    colors = listOf(
-                        Color(0xFF171C24),
-                        Color(0xFF0E1117),
-                        Color(0xFF080A0E),
-                    ),
-                ),
-            ),
+            .drawBehind {
+                drawRect(screenBgBrush)
+                drawRect(
+                    brush = ambientGlowBrush,
+                    size = androidx.compose.ui.geometry.Size(size.width, size.height * 0.48f),
+                )
+            },
     ) {
-        // Subtle ambient One-UI top glow halo behind caller card
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(380.dp)
-                .background(
-                    Brush.radialGradient(
-                        colors = listOf(glowColor, Color.Transparent),
-                    ),
-                ),
-        )
         // --- 1. Main In-Call Content ---
         Column(
             modifier = Modifier
@@ -288,9 +275,8 @@ fun CallScreen(
                 Box(
                     modifier = Modifier
                         .size(112.dp)
-                        .shadow(elevation = if (isIncomingRinging) 14.dp else 8.dp, shape = CircleShape)
                         .clip(CircleShape)
-                        .border(2.dp, if (isIncomingRinging) Color(0x8834A853) else Color(0x33FFFFFF), CircleShape),
+                        .border(2.dp, if (isIncomingRinging) Color(0x8834A853) else Color(0x38FFFFFF), CircleShape),
                     contentAlignment = Alignment.Center,
                 ) {
                     ContactAvatar(
@@ -786,26 +772,14 @@ private fun CallActionButton(
         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
         label = "actionScale",
     )
-    val containerColor by animateColorAsState(
-        targetValue = if (active) activeColor else Color(0xFF222630),
-        animationSpec = tween(180),
+    val transition = updateTransition(targetState = active, label = "actionState")
+    val containerColor by transition.animateColor(
+        transitionSpec = { tween(180) },
         label = "actionBg",
-    )
-    val iconColor by animateColorAsState(
-        targetValue = if (active) activeContentColor else Color(0xFFE8EAED),
-        animationSpec = tween(180),
-        label = "actionIcon",
-    )
-    val borderColor by animateColorAsState(
-        targetValue = if (active) activeColor else Color(0xFF323846),
-        animationSpec = tween(180),
-        label = "actionBorder",
-    )
-    val textColor by animateColorAsState(
-        targetValue = if (active) Color.White else Color(0xFF9AA0A6),
-        animationSpec = tween(180),
-        label = "actionText",
-    )
+    ) { isActive -> if (isActive) activeColor else Color(0xFF222630) }
+    val iconColor = if (active) activeContentColor else Color(0xFFE8EAED)
+    val borderColor = if (active) activeColor else Color(0xFF323846)
+    val textColor = if (active) Color.White else Color(0xFF9AA0A6)
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -870,9 +844,9 @@ private fun CallFabButton(
                 scaleX = scale
                 scaleY = scale
             }
-            .shadow(elevation = 8.dp, shape = CircleShape)
             .clip(CircleShape)
             .background(backgroundColor)
+            .border(1.dp, Color(0x28FFFFFF), CircleShape)
             .clickable(interactionSource = interaction, indication = null, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {

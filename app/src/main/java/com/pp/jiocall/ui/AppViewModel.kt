@@ -189,14 +189,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun importContacts(onComplete: ((Int) -> Unit)? = null) = app.importContacts(onComplete)
 
-    fun resolveName(number: String): String? =
-        contactLookup.value.resolveName(number) ?: PhoneUtils.resolveName(number, contacts.value)
+    fun resolveName(number: String): String? = contactLookup.value.resolveName(number)
 
-    fun resolvePhotoUri(number: String): String? {
-        if (number.isBlank()) return null
-        return contactLookup.value.resolvePhotoUri(number)
-            ?: contacts.value.firstOrNull { PhoneUtils.matches(number, it.number) }?.photoUri
-    }
+    fun resolvePhotoUri(number: String): String? = contactLookup.value.resolvePhotoUri(number)
 
     fun clearMessage() {
         _message.value = null

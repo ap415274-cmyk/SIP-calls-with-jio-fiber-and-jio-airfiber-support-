@@ -69,20 +69,37 @@ internal class AudioPlaybackEngine(
 
         val candidates = linkedSetOf(nativeOut, 48_000, primaryCodec.clockRate, 16_000, 8_000)
         for (rate in candidates) {
-            val track = createTrack(rate, lowLatency = true) ?: createTrack(rate, lowLatency = false)
-            if (track != null) {
-                audioTrack = track
-                outputRate = rate
+            val initialTrack = createTrack(rate, lowLatency = true) ?: createTrack(rate, lowLatency = false)
+            if (initialTrack != null) {
+                var selectedTrack = initialTrack
+                var selectedRate = rate
+                // If AudioFlinger denied low-latency fast-path at a different mixer rate (e.g. 48 kHz on
+                // emulators), prefer a direct track at the codec clockRate to skip software upsampling.
+                if (rate != primaryCodec.clockRate &&
+                    initialTrack.performanceMode != AudioTrack.PERFORMANCE_MODE_LOW_LATENCY
+                ) {
+                    val directTrack = createTrack(primaryCodec.clockRate, lowLatency = false)
+                    if (directTrack != null) {
+                        runCatching { initialTrack.release() }
+                        selectedTrack = directTrack
+                        selectedRate = primaryCodec.clockRate
+                    }
+                }
+                audioTrack = selectedTrack
+                outputRate = selectedRate
                 var writtenWarm = 0L
                 runCatching {
-                    track.play()
+                    selectedTrack.play()
                     // Write one silent 20ms warmup frame so hardware AEC locks onto an active RX stream immediately
-                    val prime = ShortArray(rate / 50)
-                    val w = track.write(prime, 0, prime.size, AudioTrack.WRITE_NON_BLOCKING)
+                    val prime = ShortArray(selectedRate / 50)
+                    val w = selectedTrack.write(prime, 0, prime.size, AudioTrack.WRITE_NON_BLOCKING)
                     if (w > 0) writtenWarm = w.toLong()
                 }
                 primedFrames = writtenWarm
-                Log.i(TAG, "Opened playback AudioTrack @${rate}Hz session=${track.audioSessionId} primary=${primaryCodec.mime}")
+                Log.i(
+                    TAG,
+                    "Opened playback AudioTrack @${selectedRate}Hz session=${selectedTrack.audioSessionId} primary=${primaryCodec.mime} lowLatency=${selectedTrack.performanceMode == AudioTrack.PERFORMANCE_MODE_LOW_LATENCY}",
+                )
                 return
             }
         }
@@ -172,7 +189,9 @@ internal class AudioPlaybackEngine(
             }
 
             val popped = jitterBuffer.popNext()
-            val pcmAndRate: Pair<ShortArray, Int>? = when (popped) {
+            var rawPcm: ShortArray? = null
+            var srcRate = activeCodec.clockRate
+            when (popped) {
                 is RtpJitterBuffer.PopResult.Frame -> {
                     val pkt = popped.packet
                     if (pkt.codec != activeCodec) {
@@ -182,39 +201,40 @@ internal class AudioPlaybackEngine(
                     val decoded = decodePacket(pkt)
                     if (decoded != null) {
                         concealer.recordGood(decoded)
-                        decoded to activeCodec.clockRate
+                        rawPcm = decoded
                     } else {
-                        val concealed = concealer.conceal()
-                        concealed to activeCodec.clockRate
+                        rawPcm = concealer.conceal()
                     }
+                    srcRate = activeCodec.clockRate
                 }
                 RtpJitterBuffer.PopResult.Conceal -> {
-                    concealer.conceal() to activeCodec.clockRate
+                    rawPcm = concealer.conceal()
+                    srcRate = activeCodec.clockRate
                 }
                 RtpJitterBuffer.PopResult.Wait -> {
-                    null
+                    rawPcm = null
                 }
             }
 
             if (track != null) {
-                val written: Int = if (pcmAndRate != null) {
-                    val (rawPcm, srcRate) = pcmAndRate
-                    onDecodedPcm(rawPcm, srcRate)
-                    val targetOutLen = ((rawPcm.size.toLong() * outRate) / srcRate).toInt().coerceAtLeast(1)
+                val pcmToPlay = rawPcm
+                val written: Int = if (pcmToPlay != null) {
+                    onDecodedPcm(pcmToPlay, srcRate)
+                    val targetOutLen = ((pcmToPlay.size.toLong() * outRate) / srcRate).toInt().coerceAtLeast(1)
                     if (outBuf.size < targetOutLen) {
                         outBuf = ShortArray(targetOutLen)
                     }
-                    val outLen = PcmResampler.resampleInto(rawPcm, srcRate, outRate, rawPcm.size, outBuf)
+                    val outLen = PcmResampler.resampleInto(pcmToPlay, srcRate, outRate, pcmToPlay.size, outBuf)
                     val gain = if (isSpeakerOn()) AudioGain.SPEAKER else AudioGain.EARPIECE
                     AudioGain.apply(outBuf, outLen, gain)
                     lastPeak = maxOf(lastPeak, AudioGain.peakAmplitude(outBuf, outLen))
-                    writeNonBlocking(track, outBuf, outLen)
+                    track.write(outBuf, 0, outLen, AudioTrack.WRITE_NON_BLOCKING)
                 } else {
                     // Only keep a minimal 60ms cushion when waiting for packets; never stuff HAL buffer with silence
                     val shouldPadSilence = (totalHeadFrames == 0L && writtenFrames < outFrameSamples * 2L) ||
                         (totalHeadFrames > 0L && queuedFrames < outFrameSamples * 3L)
                     if (shouldPadSilence) {
-                        writeNonBlocking(track, silence, silence.size)
+                        track.write(silence, 0, silence.size, AudioTrack.WRITE_NON_BLOCKING)
                     } else {
                         0
                     }
@@ -256,20 +276,6 @@ internal class AudioPlaybackEngine(
         }
     }
 
-    private fun writeNonBlocking(track: AudioTrack, data: ShortArray, length: Int): Int {
-        if (length <= 0) return 0
-        var total = 0
-        val first = track.write(data, 0, length, AudioTrack.WRITE_NON_BLOCKING)
-        if (first < 0) return first
-        total += first
-        if (total < length && active.get() && isRunning()) {
-            LockSupport.parkNanos(4_000_000L)
-            val second = track.write(data, total, length - total, AudioTrack.WRITE_NON_BLOCKING)
-            if (second < 0) return if (total > 0) total else second
-            total += second
-        }
-        return total
-    }
 
     private fun decodePacket(pkt: RtpJitterBuffer.Packet): ShortArray? {
         return when (pkt.codec) {

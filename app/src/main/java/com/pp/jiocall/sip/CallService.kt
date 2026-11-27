@@ -46,6 +46,8 @@ class CallService : Service() {
 
     private var lastStatusTitle: String? = null
     private var lastStatusText: String? = null
+    private var cachedAvatarKey: String? = null
+    private var cachedAvatarBitmap: Bitmap? = null
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var callJob: Job? = null
 
@@ -580,13 +582,16 @@ class CallService : Service() {
     }
 
     private fun callerAvatarBitmap(name: String, bgColor: Int): Bitmap {
+        val initial = name.firstOrNull { it.isLetterOrDigit() }?.uppercaseChar()?.toString() ?: "J"
+        val cacheKey = "${initial}_$bgColor"
+        cachedAvatarBitmap?.takeIf { !it.isRecycled && cachedAvatarKey == cacheKey }?.let { return it }
+
         val size = 96
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = bgColor }
         canvas.drawCircle(size / 2f, size / 2f, size / 2f, bgPaint)
 
-        val initial = name.firstOrNull { it.isLetterOrDigit() }?.uppercaseChar()?.toString() ?: "J"
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = android.graphics.Color.WHITE
             textSize = 44f
@@ -595,6 +600,8 @@ class CallService : Service() {
         }
         val yPos = size / 2f - (textPaint.descent() + textPaint.ascent()) / 2f
         canvas.drawText(initial, size / 2f, yPos, textPaint)
+        cachedAvatarKey = cacheKey
+        cachedAvatarBitmap = bmp
         return bmp
     }
 

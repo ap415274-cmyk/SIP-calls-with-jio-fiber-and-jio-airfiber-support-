@@ -74,6 +74,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -309,7 +310,12 @@ private fun MainContent(
     }
 
     Box(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize()) {
+        // Skip rasterizing offscreen pager tabs while full-screen CallScreen covers them.
+        Column(
+            Modifier
+                .fillMaxSize()
+                .graphicsLayer { alpha = if (fullScreenDarkCall) 0f else 1f },
+        ) {
             val currentCall = call
 
             // Persistent One-UI Top Ongoing Call Bar visible across tabs AND Settings/Accounts/Contacts
@@ -421,6 +427,49 @@ private fun MainContent(
                         }
                     },
                 ) { padding ->
+                    val openAccounts = remember(viewModel) { { dismissKeyboardAndFocus(); route = Route.Accounts } }
+                    val openSettings = remember(viewModel) { { dismissKeyboardAndFocus(); route = Route.Settings } }
+                    val toggleDark = remember(viewModel) { { viewModel.toggleDarkMode() } }
+                    val lastOutgoing = remember(calls) { calls.firstOrNull { it.outgoing }?.number.orEmpty() }
+                    val dialFromDialer = remember(viewModel, onExternalNumberConsumed) {
+                        { number: String, accountId: Long? ->
+                            dismissKeyboardAndFocus()
+                            val err = viewModel.dial(number, accountId)
+                            onExternalNumberConsumed()
+                            err
+                        }
+                    }
+                    val dialVoicemail = remember(viewModel) {
+                        { accountId: Long? ->
+                            dismissKeyboardAndFocus()
+                            viewModel.dialVoicemail(accountId)
+                            Unit
+                        }
+                    }
+                    val dialFromRecents = remember(viewModel) {
+                        { entry: com.pp.jiocall.data.CallLogEntry ->
+                            dismissKeyboardAndFocus()
+                            viewModel.callBack(entry)
+                            Unit
+                        }
+                    }
+                    val dialFromContacts = remember(viewModel) {
+                        { number: String ->
+                            dismissKeyboardAndFocus()
+                            viewModel.dial(number)
+                            Unit
+                        }
+                    }
+                    val resolveContactName = remember(viewModel) { { num: String -> viewModel.resolveName(num) } }
+                    val resolveContactPhoto = remember(viewModel) { { num: String -> viewModel.resolvePhotoUri(num) } }
+                    val openDialTab = remember(pagerScope, pagerState) {
+                        {
+                            dismissKeyboardAndFocus()
+                            pagerScope.launch { pagerState.animateScrollToPage(0, animationSpec = tween(180)) }
+                            Unit
+                        }
+                    }
+
                     Box(
                         Modifier
                             .fillMaxSize()
@@ -429,7 +478,7 @@ private fun MainContent(
                     ) {
                         HorizontalPager(
                             state = pagerState,
-                            beyondViewportPageCount = 2,
+                            beyondViewportPageCount = 1,
                             userScrollEnabled = false,
                             modifier = Modifier.fillMaxSize(),
                         ) { page ->
@@ -439,56 +488,30 @@ private fun MainContent(
                                     statuses = statuses,
                                     contacts = contacts,
                                     initialNumber = externalDialNumber.orEmpty(),
-                                    lastNumber = calls.firstOrNull { it.outgoing }?.number.orEmpty(),
-                                    onDial = { number, accountId ->
-                                        dismissKeyboardAndFocus()
-                                        val err = viewModel.dial(number, accountId)
-                                        onExternalNumberConsumed()
-                                        err
-                                    },
-                                    onDialVoicemail = { accountId ->
-                                        dismissKeyboardAndFocus()
-                                        viewModel.dialVoicemail(accountId)
-                                    },
-                                    onOpenAccounts = {
-                                        dismissKeyboardAndFocus()
-                                        route = Route.Accounts
-                                    },
-                                    onOpenSettings = {
-                                        dismissKeyboardAndFocus()
-                                        route = Route.Settings
-                                    },
+                                    lastNumber = lastOutgoing,
+                                    onDial = dialFromDialer,
+                                    onDialVoicemail = dialVoicemail,
+                                    onOpenAccounts = openAccounts,
+                                    onOpenSettings = openSettings,
                                     isDark = settings.darkMode,
-                                    onToggleDarkMode = { viewModel.toggleDarkMode() },
+                                    onToggleDarkMode = toggleDark,
                                     contactLookup = contactLookup,
                                     onInitialNumberConsumed = onExternalNumberConsumed,
                                 )
 
                                 1 -> RecentsScreen(
                                     calls = calls,
-                                    onDial = {
-                                        dismissKeyboardAndFocus()
-                                        viewModel.callBack(it)
-                                    },
-                                    onClear = { viewModel.clearCalls() },
-                                    resolveName = { viewModel.resolveName(it) },
-                                    onOpenDial = {
-                                        dismissKeyboardAndFocus()
-                                        pagerScope.launch { pagerState.animateScrollToPage(0, animationSpec = tween(180)) }
-                                    },
+                                    onDial = dialFromRecents,
+                                    onClear = remember(viewModel) { { viewModel.clearCalls() } },
+                                    resolveName = resolveContactName,
+                                    onOpenDial = openDialTab,
                                     accounts = accounts,
                                     statuses = statuses,
-                                    onOpenAccounts = {
-                                        dismissKeyboardAndFocus()
-                                        route = Route.Accounts
-                                    },
-                                    onOpenSettings = {
-                                        dismissKeyboardAndFocus()
-                                        route = Route.Settings
-                                    },
+                                    onOpenAccounts = openAccounts,
+                                    onOpenSettings = openSettings,
                                     isDark = settings.darkMode,
-                                    onToggleDarkMode = { viewModel.toggleDarkMode() },
-                                    resolvePhotoUri = { viewModel.resolvePhotoUri(it) },
+                                    onToggleDarkMode = toggleDark,
+                                    resolvePhotoUri = resolveContactPhoto,
                                     hasActiveCall = hasActiveCall,
                                     precomputedItems = recentsUi,
                                     sharedPlayback = sharedPlayback,
@@ -496,32 +519,20 @@ private fun MainContent(
 
                                 2 -> ContactsScreen(
                                     contacts = contacts,
-                                    onImportContacts = { viewModel.importContacts() },
-                                    onDial = {
-                                        dismissKeyboardAndFocus()
-                                        viewModel.dial(it)
-                                    },
-                                    onOpenDial = {
-                                        dismissKeyboardAndFocus()
-                                        pagerScope.launch { pagerState.animateScrollToPage(0, animationSpec = tween(180)) }
-                                    },
+                                    onImportContacts = remember(viewModel) { { viewModel.importContacts() } },
+                                    onDial = dialFromContacts,
+                                    onOpenDial = openDialTab,
                                     accounts = accounts,
                                     statuses = statuses,
-                                    onOpenAccounts = {
-                                        dismissKeyboardAndFocus()
-                                        route = Route.Accounts
-                                    },
-                                    onOpenSettings = {
-                                        dismissKeyboardAndFocus()
-                                        route = Route.Settings
-                                    },
+                                    onOpenAccounts = openAccounts,
+                                    onOpenSettings = openSettings,
                                     isDark = settings.darkMode,
-                                    onToggleDarkMode = { viewModel.toggleDarkMode() },
+                                    onToggleDarkMode = toggleDark,
                                     calls = calls,
                                     hasActiveCall = hasActiveCall,
                                     precomputedRows = contactRowsUi,
                                     sharedPlayback = sharedPlayback,
-                                    onSyncContactsIfNeeded = { viewModel.importContactsIfNeeded() },
+                                    onSyncContactsIfNeeded = remember(viewModel) { { viewModel.importContactsIfNeeded() } },
                                 )
                             }
                         }
