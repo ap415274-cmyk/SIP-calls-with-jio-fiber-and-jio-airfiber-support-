@@ -1,6 +1,8 @@
 package com.pp.jiocall.sip
 
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -51,6 +53,21 @@ internal class RtpJitterBuffer(
         primed = false
         consecutiveConceals = 0
         consecutiveGood = 0
+    }
+
+    /**
+     * Sheds excess buffered packets when playout falls behind wall clock so
+     * emulator/CPU stalls recover immediately instead of playing seconds late.
+     */
+    fun trimBacklog(maxKeepFrames: Int = 2) = synchronized(lock) {
+        if (queue.size <= maxKeepFrames) return
+        while (queue.size > maxKeepFrames) {
+            val oldest = findOldestSeq() ?: break
+            queue.remove(oldest)
+            nextSeq = (oldest + 1) and 0xFFFF
+        }
+        primed = queue.isNotEmpty()
+        consecutiveConceals = 0
     }
 
     fun push(packet: Packet) = synchronized(lock) {
@@ -209,15 +226,68 @@ internal class PcmConcealer(private val sampleRate: Int) {
 }
 
 /**
- * Anti-aliased Windowed-Sinc / Cubic PCM resampler supporting arbitrary sample-rate
- * conversions (`48000 <-> 16000`, `48000 <-> 8000`, `44100 <-> 16000`, `16000 <-> 8000`).
+ * Anti-aliased precomputed polyphase Blackman-Sinc / Catmull-Rom PCM resampler
+ * supporting arbitrary sample-rate conversions (`48000 <-> 16000`, `48000 <-> 8000`,
+ * `44100 <-> 16000`, `16000 <-> 8000`).
  *
- * Crucially applies a Hamming-windowed sinc low-pass kernel when downsampling so
- * high-frequency energy does not alias back into the speech band as metallic or
- * robotic distortion.
+ * Precomputes each downsampling FIR kernel once per `(srcRate, dstRate)` pair so
+ * the 20 ms real-time audio loop performs zero `sin`/`cos` calls.
  */
 internal object PcmResampler {
     private const val SINC_HALF_TAPS = 8
+    private const val MAX_HALF_TAPS = 65
+    private const val FRACTIONAL_PHASES = 128
+
+    private class DownsampleKernel(
+        val support: Int,
+        val taps: Int,
+        val phases: Int,
+        val exactIntStep: Int,
+        val coeffs: FloatArray,
+    )
+
+    private val kernelCache = ConcurrentHashMap<Long, DownsampleKernel>()
+
+    private fun kernelFor(srcRate: Int, dstRate: Int): DownsampleKernel {
+        val key = (srcRate.toLong() shl 32) or (dstRate.toLong() and 0xFFFF_FFFFL)
+        return kernelCache.getOrPut(key) { buildKernel(srcRate, dstRate) }
+    }
+
+    private fun buildKernel(srcRate: Int, dstRate: Int): DownsampleKernel {
+        val ratio = dstRate.toDouble() / srcRate.toDouble()
+        val cutoff = minOf(0.92, ratio * 0.92)
+        val support = (10.0 / cutoff).toInt().coerceIn(SINC_HALF_TAPS, MAX_HALF_TAPS)
+        val taps = support * 2 + 1
+        val exactIntStep = if (srcRate % dstRate == 0) srcRate / dstRate else 0
+        val phases = if (exactIntStep > 0) 1 else FRACTIONAL_PHASES
+        val coeffs = FloatArray(phases * taps)
+
+        for (p in 0 until phases) {
+            val frac = if (phases == 1) 0.0 else p.toDouble() / phases.toDouble()
+            val rowOff = p * taps
+            var weightSum = 0.0
+            for (k in -support..support) {
+                val dist = k.toDouble() - frac
+                val norm = dist / support
+                if (abs(norm) >= 1.0) continue
+                val win = 0.42 + 0.50 * cos(PI * norm) + 0.08 * cos(2.0 * PI * norm)
+                val x = cutoff * dist
+                val sinc = if (abs(x) < 1e-6) 1.0 else sin(PI * x) / (PI * x)
+                val w = sinc * win
+                coeffs[rowOff + k + support] = w.toFloat()
+                weightSum += w
+            }
+            if (weightSum > 1e-6) {
+                val inv = (1.0 / weightSum).toFloat()
+                for (t in 0 until taps) {
+                    coeffs[rowOff + t] *= inv
+                }
+            } else {
+                coeffs[rowOff + support] = 1.0f
+            }
+        }
+        return DownsampleKernel(support, taps, phases, exactIntStep, coeffs)
+    }
 
     fun resample(input: ShortArray, srcRate: Int, dstRate: Int, length: Int = input.size): ShortArray {
         val count = minOf(length, input.size)
@@ -226,54 +296,85 @@ internal object PcmResampler {
 
         val outLen = ((count.toLong() * dstRate) / srcRate).toInt().coerceAtLeast(1)
         val out = ShortArray(outLen)
-        val ratio = dstRate.toDouble() / srcRate.toDouble()
-        val cutoff = minOf(0.92, ratio * 0.92)
-        val step = srcRate.toDouble() / dstRate.toDouble()
+        resampleInto(input, srcRate, dstRate, count, out)
+        return out
+    }
+
+    fun resampleInto(
+        input: ShortArray,
+        srcRate: Int,
+        dstRate: Int,
+        length: Int,
+        out: ShortArray,
+    ): Int {
+        val count = minOf(length, input.size)
+        if (count <= 0 || srcRate <= 0 || dstRate <= 0) return 0
+        if (srcRate == dstRate) {
+            val copyLen = minOf(count, out.size)
+            System.arraycopy(input, 0, out, 0, copyLen)
+            return copyLen
+        }
+
+        val outLen = ((count.toLong() * dstRate) / srcRate).toInt().coerceIn(1, out.size)
 
         if (dstRate < srcRate) {
-            // Downsampling with anti-aliasing Blackman-windowed sinc kernel
-            val support = (10.0 / cutoff).toInt().coerceAtLeast(SINC_HALF_TAPS)
+            val kernel = kernelFor(srcRate, dstRate)
+            val support = kernel.support
+            val taps = kernel.taps
+            val coeffs = kernel.coeffs
+            val intStep = kernel.exactIntStep
+            val step = srcRate.toDouble() / dstRate.toDouble()
+            val maxInIdx = count - 1
+
             for (i in 0 until outLen) {
-                val center = i * step
-                val base = center.toInt()
-                var sum = 0.0
-                var weightSum = 0.0
-                for (j in (base - support)..(base + support)) {
-                    val dist = j - center
-                    val norm = dist / support
-                    if (kotlin.math.abs(norm) >= 1.0) continue
-                    val win = 0.42 + 0.50 * cos(PI * norm) + 0.08 * cos(2.0 * PI * norm)
-                    val x = cutoff * dist
-                    val sinc = if (kotlin.math.abs(x) < 1e-6) 1.0 else sin(PI * x) / (PI * x)
-                    val w = sinc * win
-                    val sampleVal = input[j.coerceIn(0, count - 1)].toDouble()
-                    sum += sampleVal * w
-                    weightSum += w
+                val base: Int
+                val rowOff: Int
+                if (intStep > 0) {
+                    base = i * intStep
+                    rowOff = 0
+                } else {
+                    val pos = i * step
+                    base = pos.toInt()
+                    val phase = ((pos - base) * kernel.phases).toInt().coerceIn(0, kernel.phases - 1)
+                    rowOff = phase * taps
                 }
-                val sample = if (weightSum > 1e-6) sum / weightSum else input[base.coerceIn(0, count - 1)].toDouble()
-                out[i] = sample.roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+
+                var sum = 0.0f
+                val startIn = base - support
+                if (startIn >= 0 && base + support <= maxInIdx) {
+                    for (t in 0 until taps) {
+                        sum += input[startIn + t].toFloat() * coeffs[rowOff + t]
+                    }
+                } else {
+                    for (t in 0 until taps) {
+                        val idx = (startIn + t).coerceIn(0, maxInIdx)
+                        sum += input[idx].toFloat() * coeffs[rowOff + t]
+                    }
+                }
+                out[i] = sum.roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
             }
         } else {
-            // Upsampling with Catmull-Rom cubic interpolation for smooth waveform reconstruction
+            val step = srcRate.toFloat() / dstRate.toFloat()
+            val maxInIdx = count - 1
             for (i in 0 until outLen) {
                 val pos = i * step
-                val i1 = pos.toInt().coerceIn(0, count - 1)
+                val i1 = pos.toInt().coerceIn(0, maxInIdx)
                 val t = pos - i1
-                val p0 = input[(i1 - 1).coerceAtLeast(0)].toDouble()
-                val p1 = input[i1].toDouble()
-                val p2 = input[(i1 + 1).coerceAtMost(count - 1)].toDouble()
-                val p3 = input[(i1 + 2).coerceAtMost(count - 1)].toDouble()
+                val p0 = input[(i1 - 1).coerceAtLeast(0)].toFloat()
+                val p1 = input[i1].toFloat()
+                val p2 = input[(i1 + 1).coerceAtMost(maxInIdx)].toFloat()
+                val p3 = input[(i1 + 2).coerceAtMost(maxInIdx)].toFloat()
                 val t2 = t * t
                 val t3 = t2 * t
-                val valInterp = 0.5 * (
-                    (2.0 * p1) +
+                val valInterp = 0.5f * (
+                    (2.0f * p1) +
                         (-p0 + p2) * t +
-                        (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
-                        (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                        (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+                        (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3
                     )
                 out[i] = valInterp.roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
             }
         }
-        return out
+        return outLen
     }
 }

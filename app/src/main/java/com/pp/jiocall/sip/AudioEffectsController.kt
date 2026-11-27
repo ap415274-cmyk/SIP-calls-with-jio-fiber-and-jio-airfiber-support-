@@ -108,24 +108,28 @@ internal class AudioEffectsController {
         fun isAospSoftwareNs(desc: AudioEffect.Descriptor?): Boolean =
             desc != null && desc.uuid == AOSP_SW_NS_UUID
 
-        fun isHardwareAecSupported(): Boolean {
+        private val hwAecAvailable: Boolean by lazy {
             if (!runCatching { AcousticEchoCanceler.isAvailable() }.getOrDefault(false)) {
-                return false
+                return@lazy false
             }
-            val effects = runCatching { AudioEffect.queryEffects() }.getOrNull() ?: return false
-            return effects.any {
+            val effects = runCatching { AudioEffect.queryEffects() }.getOrNull() ?: return@lazy false
+            effects.any {
                 it.type == AudioEffect.EFFECT_TYPE_AEC && !isAospSoftwareAec(it)
             }
         }
 
-        fun isHardwareNsSupported(): Boolean {
+        private val hwNsAvailable: Boolean by lazy {
             if (!runCatching { NoiseSuppressor.isAvailable() }.getOrDefault(false)) {
-                return false
+                return@lazy false
             }
-            val effects = runCatching { AudioEffect.queryEffects() }.getOrNull() ?: return false
-            return effects.any {
+            val effects = runCatching { AudioEffect.queryEffects() }.getOrNull() ?: return@lazy false
+            effects.any {
                 it.type == AudioEffect.EFFECT_TYPE_NS && !isAospSoftwareNs(it)
             }
         }
+
+        fun isHardwareAecSupported(): Boolean = hwAecAvailable
+
+        fun isHardwareNsSupported(): Boolean = hwNsAvailable
     }
 }

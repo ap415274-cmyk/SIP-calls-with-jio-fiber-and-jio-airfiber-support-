@@ -58,7 +58,7 @@ internal object AmrFraming {
         if (raw.isEmpty()) return emptyList()
         var offset = 0
         val hdr = if (isWideband) STORAGE_HDR_WB else STORAGE_HDR_NB
-        if (raw.size >= hdr.size && raw.sliceArray(0 until hdr.size).contentEquals(hdr)) {
+        if (hasHeader(raw, hdr)) {
             offset = hdr.size
         }
         val out = ArrayList<ByteArray>(2)
@@ -146,11 +146,20 @@ internal object AmrFraming {
         isWideband: Boolean,
     ): ByteArray? = unpackBandwidthEfficient(data, offset, length, isWideband)?.frames?.firstOrNull()
 
+    private fun hasHeader(raw: ByteArray, hdr: ByteArray): Boolean {
+        if (raw.size < hdr.size) return false
+        for (i in hdr.indices) {
+            if (raw[i] != hdr[i]) return false
+        }
+        return true
+    }
+
     fun unpackBandwidthEfficient(
         data: ByteArray,
         offset: Int,
         length: Int,
         isWideband: Boolean,
+        requireExactLength: Boolean = false,
     ): UnpackResult? {
         if (length < 2 || offset < 0 || offset + length > data.size) return null
 
@@ -164,8 +173,9 @@ internal object AmrFraming {
         var bitPos = 4
         val totalPayloadBits = length * 8
 
-        data class TocEntry(val ft: Int, val q: Int)
-        val entries = ArrayList<TocEntry>(2)
+        var packedTocs = IntArray(4)
+        var tocCount = 0
+        var expectedSpeechBits = 0
         while (bitPos + 6 <= totalPayloadBits) {
             val f = readBit(bitPos)
             val ft = (readBit(bitPos + 1) shl 3) or
@@ -175,21 +185,31 @@ internal object AmrFraming {
             val q = readBit(bitPos + 5)
             bitPos += 6
             if (!isValidFt(ft, isWideband)) return null
-            entries.add(TocEntry(ft, q))
+            if (tocCount == packedTocs.size) packedTocs = packedTocs.copyOf(packedTocs.size * 2)
+            packedTocs[tocCount++] = (ft shl 1) or q
+            if (ft != 14 && ft != 15) {
+                expectedSpeechBits += speechBitsForFt(ft, isWideband)
+            }
             if (f == 0) break
         }
-        if (entries.isEmpty()) return null
+        if (tocCount == 0) return null
+        if (requireExactLength && ((bitPos + expectedSpeechBits + 7) / 8) != length) {
+            return null
+        }
 
-        val frames = ArrayList<ByteArray>(entries.size)
-        for (entry in entries) {
-            if (entry.ft == 14 || entry.ft == 15) continue
-            val speechBits = speechBitsForFt(entry.ft, isWideband)
+        val frames = ArrayList<ByteArray>(tocCount)
+        for (idx in 0 until tocCount) {
+            val packed = packedTocs[idx]
+            val ft = packed ushr 1
+            val q = packed and 0x01
+            if (ft == 14 || ft == 15) continue
+            val speechBits = speechBitsForFt(ft, isWideband)
             if (speechBits <= 0 || bitPos + speechBits > totalPayloadBits) {
                 if (frames.isEmpty()) return null
                 break
             }
             val frame = ByteArray(1 + (speechBits + 7) / 8)
-            frame[0] = ((entry.ft shl 3) or (entry.q shl 2)).toByte()
+            frame[0] = ((ft shl 3) or (q shl 2)).toByte()
             for (bit in 0 until speechBits) {
                 if (readBit(bitPos + bit) != 0) {
                     val dstIdx = 1 + (bit ushr 3)
@@ -297,14 +317,9 @@ internal object AmrFraming {
         val tryPrimary = if (negotiatedOctetAligned) {
             unpackOctetAligned(data, offset, length, isWideband)
         } else {
-            // Even when SDP says BE, verify packet length against BE before trusting it;
+            // Even when SDP says BE, verify packet length against BE in one pass before trusting it;
             // some IMS SBCs emit OA anyway (check Q=1 bug from AmrFramingTest!).
-            val be = unpackBandwidthEfficient(data, offset, length, isWideband)
-            if (be != null && matchesExactBeLength(data, offset, length, isWideband)) {
-                be
-            } else {
-                null
-            }
+            unpackBandwidthEfficient(data, offset, length, isWideband, requireExactLength = true)
         }
         if (tryPrimary != null) return tryPrimary
 
@@ -314,38 +329,6 @@ internal object AmrFraming {
             unpackOctetAligned(data, offset, length, isWideband)
         }
         return fallback
-    }
-
-    private fun matchesExactBeLength(
-        data: ByteArray,
-        offset: Int,
-        length: Int,
-        isWideband: Boolean,
-    ): Boolean {
-        fun readBit(bitIndex: Int): Int {
-            val byteIdx = offset + (bitIndex ushr 3)
-            if (byteIdx >= offset + length) return 0
-            return (data[byteIdx].toInt() ushr (7 - (bitIndex and 7))) and 1
-        }
-        var bitPos = 4
-        val totalBits = length * 8
-        var speechBitsTotal = 0
-        var count = 0
-        while (bitPos + 6 <= totalBits) {
-            val f = readBit(bitPos)
-            val ft = (readBit(bitPos + 1) shl 3) or
-                (readBit(bitPos + 2) shl 2) or
-                (readBit(bitPos + 3) shl 1) or
-                readBit(bitPos + 4)
-            bitPos += 6
-            if (!isValidFt(ft, isWideband)) return false
-            if (ft != 14 && ft != 15) speechBitsTotal += speechBitsForFt(ft, isWideband)
-            count++
-            if (f == 0) break
-        }
-        if (count == 0) return false
-        val expectedBytes = (4 + 6 * count + speechBitsTotal + 7) / 8
-        return expectedBytes == length
     }
 
     fun extractFrame(

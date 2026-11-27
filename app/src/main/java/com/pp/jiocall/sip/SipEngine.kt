@@ -67,7 +67,7 @@ class SipEngine(private val context: Context, private val store: Store) {
     @Volatile private var settings = AppSettings()
     @Volatile private var accounts: List<Account> = emptyList()
     private val agents = ConcurrentHashMap<Long, SipAccount>()
-    private var active: SipCall? = null
+    @Volatile private var active: SipCall? = null
     private var secondary: SipCall? = null
     private val locallyDeclinedCallIds = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var speakerOn = false
@@ -76,6 +76,7 @@ class SipEngine(private val context: Context, private val store: Store) {
     val call = MutableStateFlow<CallSnapshot?>(null)
     val secondaryCall = MutableStateFlow<CallSnapshot?>(null)
     val speaker = MutableStateFlow(false)
+    val quality = MutableStateFlow<CallQuality?>(null)
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var qualityJob: Job? = null
@@ -172,7 +173,7 @@ class SipEngine(private val context: Context, private val store: Store) {
         speakerOn = settings.speakerphone
         speaker.value = speakerOn
         agent.setSpeaker(speakerOn)
-        ToneGenerator.applyCommunicationRoute(context, speakerOn)
+        val selectedSpeaker = speakerOn
         // Promote CallService to PHONE_CALL | MICROPHONE before INVITE/183 starts AudioRecord.
         val preDialName = com.pp.jiocall.data.PhoneUtils.resolveName(number, store.loadContacts()) ?: number
         CallService.showOngoing(context, preDialName.ifEmpty { "Call" }, "Dialing…", 0L, false, speakerOn)
@@ -192,8 +193,12 @@ class SipEngine(private val context: Context, private val store: Store) {
             return call.error ?: "Call failed"
         }
         active = call
+        quality.value = null
         publish(call)
-        updateProximityLock()
+        scope.launch(Dispatchers.IO) {
+            ToneGenerator.applyCommunicationRoute(context, selectedSpeaker)
+            updateProximityLock()
+        }
         val callerName = call.remoteName.ifEmpty { call.remoteNumber.ifEmpty { "Call" } }
         CallService.showOngoing(context, callerName, "Dialing…", 0L, call.muted, speakerOn)
         null
@@ -318,6 +323,9 @@ class SipEngine(private val context: Context, private val store: Store) {
         stopRingtone(resetMode = true)
         terminalClearJob?.cancel()
         terminalClearJob = null
+        qualityJob?.cancel()
+        qualityJob = null
+        quality.value = null
         secondary?.let { waiting -> agentFor(waiting)?.hangup(waiting) }
         secondary = null
         secondaryCall.value = null
@@ -343,15 +351,22 @@ class SipEngine(private val context: Context, private val store: Store) {
         hold
     }
 
-    fun toggleSpeaker(): Boolean = synchronized(lock) {
-        speakerOn = !speakerOn
-        agents.values.forEach { it.setSpeaker(speakerOn) }
-        if (active?.outgoing == true && active?.media == null) {
-            ToneGenerator.applyCommunicationRoute(context, speakerOn)
+    fun toggleSpeaker(): Boolean {
+        val newSpeaker: Boolean
+        synchronized(lock) {
+            speakerOn = !speakerOn
+            newSpeaker = speakerOn
+            speaker.value = newSpeaker
         }
-        speaker.value = speakerOn
-        updateProximityLock()
-        speakerOn
+        scope.launch(Dispatchers.IO) {
+            agents.values.forEach { it.setSpeaker(newSpeaker) }
+            val current = active
+            if (current?.outgoing == true && current.media == null) {
+                ToneGenerator.applyCommunicationRoute(context, newSpeaker)
+            }
+            updateProximityLock()
+        }
+        return newSpeaker
     }
 
     fun toggleRecord(): Boolean = synchronized(lock) {
@@ -395,6 +410,7 @@ class SipEngine(private val context: Context, private val store: Store) {
         secondaryCall.value = null
         active = null
         call.value = null
+        quality.value = null
         releaseProximityLock()
     }
 
@@ -460,18 +476,22 @@ class SipEngine(private val context: Context, private val store: Store) {
 
         if (finished) {
             ToneGenerator.stopRingback()
-            runCatching { logCall(call) }
-            call.media?.stop()
+            val finishedMedia = call.media
             call.media = null
 
             if (isSecondary) {
                 secondary = null
                 secondaryCall.value = null
+                scope.launch(Dispatchers.IO) {
+                    finishedMedia?.stop()
+                    runCatching { logCall(call) }
+                }
                 return
             }
             if (isActive) {
                 qualityJob?.cancel()
                 qualityJob = null
+                quality.value = null
                 val remaining = secondary
                 if (remaining != null && remaining.state != CallState.ENDED && remaining.state != CallState.FAILED) {
                     secondary = null
@@ -488,20 +508,17 @@ class SipEngine(private val context: Context, private val store: Store) {
                         if (remaining.onHold) agentFor(remaining)?.setHold(remaining, false)
                         publish(remaining)
                     }
-                    updateProximityLock()
+                    scope.launch(Dispatchers.IO) {
+                        finishedMedia?.stop()
+                        runCatching { logCall(call) }
+                        updateProximityLock()
+                    }
                     return
                 }
 
                 active = null
                 ToneGenerator.releaseDtmf()
                 releaseProximityLock()
-                runCatching {
-                    val manager = context.getSystemService(AudioManager::class.java)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        manager?.clearCommunicationDevice()
-                    }
-                    manager?.mode = AudioManager.MODE_NORMAL
-                }
                 if (this.call.value?.callId == call.callId) {
                     if (locallyDeclinedCallIds.remove(call.callId)) {
                         this.call.value = null
@@ -521,8 +538,27 @@ class SipEngine(private val context: Context, private val store: Store) {
                 } else {
                     locallyDeclinedCallIds.remove(call.callId)
                 }
-            } else if (this.call.value?.callId == call.callId) {
-                this.call.value = null
+                scope.launch(Dispatchers.IO) {
+                    finishedMedia?.stop()
+                    runCatching { logCall(call) }
+                    if (synchronized(lock) { active == null }) {
+                        runCatching {
+                            val manager = context.getSystemService(AudioManager::class.java)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                manager?.clearCommunicationDevice()
+                            }
+                            manager?.mode = AudioManager.MODE_NORMAL
+                        }
+                    }
+                }
+            } else {
+                if (this.call.value?.callId == call.callId) {
+                    this.call.value = null
+                }
+                scope.launch(Dispatchers.IO) {
+                    finishedMedia?.stop()
+                    runCatching { logCall(call) }
+                }
             }
             return
         }
@@ -538,9 +574,9 @@ class SipEngine(private val context: Context, private val store: Store) {
                 qualityJob = scope.launch {
                     while (this.isActive) {
                         delay(1000)
-                        synchronized(lock) {
-                            val current = active ?: return@launch
-                            if (current.answered) publish(current)
+                        val current = active ?: break
+                        if (current.answered) {
+                            quality.value = current.media?.getQuality()
                         }
                     }
                 }

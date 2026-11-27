@@ -210,4 +210,41 @@ class AudioEngineTest {
         val clippedNeg = CallRecorder.mixSoftKnee(-25_000, -25_000)
         assertTrue(clippedNeg in -32_767..-26_001)
     }
+
+    @Test
+    fun jitterBufferTrimBacklogKeepsNewestFramesInOrder() {
+        val jb = RtpJitterBuffer(minPrefillFrames = 2, maxCapacityFrames = 24)
+        for (seq in 100 until 106) {
+            jb.push(RtpJitterBuffer.Packet(seq = seq, timestamp = seq * 160L, codec = Codec.AMR_NB, frame = byteArrayOf(seq.toByte())))
+        }
+        // Prime and consume first packet (seq=100)
+        val first = jb.popNext() as RtpJitterBuffer.PopResult.Frame
+        assertEquals(100, first.packet.seq)
+
+        // Shed backlog down to the newest 2 packets (104, 105)
+        jb.trimBacklog(maxKeepFrames = 2)
+        val p1 = jb.popNext() as RtpJitterBuffer.PopResult.Frame
+        val p2 = jb.popNext() as RtpJitterBuffer.PopResult.Frame
+        assertEquals(104, p1.packet.seq)
+        assertEquals(105, p2.packet.seq)
+        assertEquals(0L, jb.totalLost)
+    }
+
+    @Test
+    fun resamplerSupportsUpsamplingAndFractionalRatesIntoBuffer() {
+        val in8k = ShortArray(160) { i ->
+            (8_000.0 * sin(2.0 * PI * 1000.0 * i / 8_000.0)).roundToInt().toShort()
+        }
+        val dst48k = ShortArray(960)
+        val written48 = PcmResampler.resampleInto(in8k, 8_000, 48_000, in8k.size, dst48k)
+        assertEquals(960, written48)
+        assertTrue(dst48k.maxOf { kotlin.math.abs(it.toInt()) } > 6000)
+
+        val in44 = ShortArray(882) { i ->
+            (8_000.0 * sin(2.0 * PI * 1000.0 * i / 44_100.0)).roundToInt().toShort()
+        }
+        val out16 = PcmResampler.resample(in44, 44_100, 16_000)
+        assertEquals(320, out16.size)
+        assertTrue(out16.maxOf { kotlin.math.abs(it.toInt()) } > 5000)
+    }
 }

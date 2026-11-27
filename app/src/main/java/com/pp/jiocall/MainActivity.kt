@@ -271,8 +271,8 @@ private fun MainContent(
     }
 
     if (!view.isInEditMode) {
-        SideEffect {
-            val window = (view.context as? Activity)?.window ?: return@SideEffect
+        LaunchedEffect(settings.darkMode, fullScreenDarkCall) {
+            val window = (view.context as? Activity)?.window ?: return@LaunchedEffect
             val darkIcons = !settings.darkMode && !fullScreenDarkCall
             val controller = WindowCompat.getInsetsController(window, view)
             controller.isAppearanceLightStatusBars = darkIcons
@@ -341,6 +341,7 @@ private fun MainContent(
                             onToggleMute = { viewModel.toggleMute() },
                             onToggleSpeaker = { viewModel.toggleSpeaker() },
                             onAnswer = { viewModel.answer() },
+                            qualityFlow = viewModel.callQuality,
                         )
                     }
                 }
@@ -637,6 +638,9 @@ private fun MainContent(
             ) + scaleOut(targetScale = 0.96f, animationSpec = tween(220)) + fadeOut(animationSpec = tween(180)),
         ) {
             if (currentCall != null) {
+                val callPhotoUri = remember(currentCall.number, contacts) {
+                    viewModel.resolvePhotoUri(currentCall.number)
+                }
                 CallScreen(
                     call = currentCall,
                     speakerOn = speaker,
@@ -659,7 +663,8 @@ private fun MainContent(
                     onAnswerWaiting = { viewModel.answerWaiting() },
                     onDeclineWaiting = { viewModel.declineWaiting() },
                     onSwapCalls = { viewModel.swapCalls() },
-                    photoUri = viewModel.resolvePhotoUri(currentCall.number),
+                    photoUri = callPhotoUri,
+                    qualityFlow = viewModel.callQuality,
                 )
             }
         }

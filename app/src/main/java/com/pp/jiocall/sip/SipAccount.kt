@@ -461,17 +461,22 @@ class SipAccount(
             call.media?.setMuted(call.muted || hold)
             call.media?.setRemotePaused(hold)
             call.state = if (hold) CallState.HELD else CallState.ACTIVE
-            val media = call.media ?: return
-            val address = advertisedAddress(media)
-            val body = Sdp.offer(address, media.port, CodecSupport.offer(settings().codecs()), System.currentTimeMillis())
-                .replace("a=sendrecv", if (hold) "a=sendonly" else "a=sendrecv")
-            val target = call.remoteTarget.ifEmpty { call.remoteUri }
-            call.dialogCseq += 1
-            call.holdCseq = call.dialogCseq  // remember which CSeq this re-INVITE used
-            val request = buildDialogRequest("INVITE", target, call, body)
-            transport?.send(request)
         }
         notify(call)
+        scope.launch(Dispatchers.IO) {
+            synchronized(call) {
+                val media = call.media ?: return@launch
+                if (call.state == CallState.ENDED || call.state == CallState.FAILED) return@launch
+                val address = advertisedAddress(media)
+                val body = Sdp.offer(address, media.port, CodecSupport.offer(settings().codecs()), System.currentTimeMillis())
+                    .replace("a=sendrecv", if (hold) "a=sendonly" else "a=sendrecv")
+                val target = call.remoteTarget.ifEmpty { call.remoteUri }
+                call.dialogCseq += 1
+                call.holdCseq = call.dialogCseq  // remember which CSeq this re-INVITE used
+                val request = buildDialogRequest("INVITE", target, call, body)
+                transport?.send(request)
+            }
+        }
     }
 
     fun isRecording(callId: String): Boolean = calls[callId]?.media?.isRecording == true
@@ -1469,15 +1474,18 @@ class SipAccount(
         Log.i("JioCall", "call ${call.remoteNumber} ended: $reason")
         call.state = CallState.ENDED
         call.endedAt = System.currentTimeMillis()
-        if (call.recording) {
-            val file = call.media?.stopRecording()
+        val oldMedia = call.media
+        call.media = null
+        if (call.recording && oldMedia != null) {
+            val file = oldMedia.stopRecording()
             call.recording = false
             if (file != null && file.exists() && file.length() > 44) {
                 call.recordingPath = file.absolutePath
             }
         }
-        call.media?.stop()
-        call.media = null
+        if (oldMedia != null) {
+            scope.launch(Dispatchers.IO) { oldMedia.stop() }
+        }
         if (call.error == null) call.error = reason
         calls.remove(call.callId)
         notify(call)

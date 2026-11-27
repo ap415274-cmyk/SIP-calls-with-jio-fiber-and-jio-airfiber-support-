@@ -180,10 +180,12 @@ internal class AmrEncoder(
     private val lock = Any()
     private val allowedModes: Set<Int>? = modeSet?.filter { it in validModes(codec) }?.toSet()?.takeIf { it.isNotEmpty() }
     private var activeMode: Int = pickInitialMode(codec, allowedModes)
+    @Volatile private var pendingCmr: Int = -1
     private var mediaCodec: MediaCodec? = null
     private var presentationUs: Long = 0L
     private val pendingFrames = ArrayDeque<ByteArray>()
     private val scratchBytes = ByteArray(codec.samplesPerFrame * 2)
+    private val bufferInfo = MediaCodec.BufferInfo()
 
     init {
         openCodec(bitrateForMode(codec, activeMode))
@@ -199,6 +201,10 @@ internal class AmrEncoder(
                 val fmt = MediaFormat.createAudioFormat(androidMime, codec.clockRate, 1).apply {
                     setInteger(MediaFormat.KEY_BIT_RATE, rate)
                     setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, codec.samplesPerFrame * 4)
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    }
                 }
                 mc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 mc.start()
@@ -216,6 +222,13 @@ internal class AmrEncoder(
             }
         }
         throw IllegalStateException("Could not initialize $androidMime encoder", lastError)
+    }
+
+    /** Non-blocking request from RTP RX thread; applied on the TX encode thread. */
+    fun requestCmr(cmr: Int) {
+        if (cmr in validModes(codec)) {
+            pendingCmr = cmr
+        }
     }
 
     /** Honors remote CMR mode changes (0..8 for WB, 0..7 for NB) within SDP mode-set. */
@@ -251,6 +264,11 @@ internal class AmrEncoder(
     fun encode(pcm: ShortArray): ByteArray? = encodeFrames(pcm).firstOrNull()
 
     fun encodeFrames(pcm: ShortArray): List<ByteArray> = synchronized(lock) {
+        val requestedCmr = pendingCmr
+        if (requestedCmr >= 0) {
+            pendingCmr = -1
+            adaptToCmr(requestedCmr)
+        }
         val mc = mediaCodec ?: return@synchronized emptyList()
         if (pcm.size != codec.samplesPerFrame) return@synchronized emptyList()
 
@@ -261,7 +279,7 @@ internal class AmrEncoder(
             scratchBytes[(i shl 1) + 1] = ((s ushr 8) and 0xFF).toByte()
         }
 
-        val inIdx = mc.dequeueInputBuffer(20_000L)
+        val inIdx = mc.dequeueInputBuffer(12_000L)
         if (inIdx >= 0) {
             val inBuf = mc.getInputBuffer(inIdx)
             if (inBuf != null) {
@@ -275,8 +293,8 @@ internal class AmrEncoder(
         }
 
         val isWideband = codec == Codec.AMR_WB
-        val info = MediaCodec.BufferInfo()
-        var waitUs = 15_000L
+        val info = bufferInfo
+        var waitUs = 12_000L
         var retries = 0
         while (retries < 16) {
             retries++
@@ -381,9 +399,14 @@ internal class AmrEncoder(
  */
 internal class AmrDecoder(private val codec: Codec) {
     private val lock = Any()
+    private val bufferInfo = MediaCodec.BufferInfo()
     private val mc: MediaCodec = CodecSupport.createPreferredCodec(codec.androidMime, encoder = false).also {
         val fmt = MediaFormat.createAudioFormat(codec.androidMime, codec.clockRate, 1).apply {
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 128)
+            setInteger(MediaFormat.KEY_PRIORITY, 0)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            }
         }
         it.configure(fmt, null, null, 0)
         it.start()
@@ -405,8 +428,8 @@ internal class AmrDecoder(private val codec: Codec) {
         mc.queueInputBuffer(inIdx, 0, frame.size, presentationUs, 0)
         presentationUs += 20_000L
 
-        val info = MediaCodec.BufferInfo()
-        var waitUs = 15_000L
+        val info = bufferInfo
+        var waitUs = 12_000L
         var decoded: ShortArray? = null
         var retries = 0
         while (retries < 16) {
@@ -424,7 +447,7 @@ internal class AmrDecoder(private val codec: Codec) {
                         decoded = pcm
                     }
                     mc.releaseOutputBuffer(outIdx, false)
-                    if (decoded != null) return@synchronized decoded
+                    // Keep draining with 0 us so any delayed output frames catch up immediately
                     waitUs = 0L
                 }
                 outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> continue

@@ -69,6 +69,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val activeCall = engine.call
     val secondaryCall = engine.secondaryCall
     val speaker = engine.speaker
+    val callQuality = engine.quality
 
     private val _message = MutableStateFlow<String?>(null)
     val message = _message.asStateFlow()

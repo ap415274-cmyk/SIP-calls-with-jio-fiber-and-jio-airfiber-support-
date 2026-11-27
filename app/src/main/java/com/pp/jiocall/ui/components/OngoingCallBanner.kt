@@ -50,7 +50,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.pp.jiocall.R
+import com.pp.jiocall.sip.CallQuality
 import com.pp.jiocall.sip.CallSnapshot
 import com.pp.jiocall.sip.CallState
 import com.pp.jiocall.ui.callStateLabel
@@ -58,6 +60,7 @@ import com.pp.jiocall.ui.formatDuration
 import com.pp.jiocall.ui.theme.GoogleCallAnswer
 import com.pp.jiocall.ui.theme.GoogleCallEnd
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Persistent One-UI / Google-Phone inspired top Ongoing Call Bar.
@@ -73,6 +76,7 @@ fun OngoingCallBanner(
     onToggleMute: (() -> Unit)? = null,
     onToggleSpeaker: (() -> Unit)? = null,
     onAnswer: (() -> Unit)? = null,
+    qualityFlow: StateFlow<CallQuality?>? = null,
     modifier: Modifier = Modifier,
 ) {
     val haptic = LocalHapticFeedback.current
@@ -161,22 +165,11 @@ fun OngoingCallBanner(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false),
                     )
-                    if (call.quality?.isHdVoice == true && call.answered) {
-                        Spacer(Modifier.width(6.dp))
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(5.dp))
-                                .background(Color(0x338AB4F8))
-                                .padding(horizontal = 5.dp, vertical = 1.dp),
-                        ) {
-                            Text(
-                                text = "HD",
-                                fontSize = 9.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color(0xFFB3D1FF),
-                            )
-                        }
-                    }
+                    BannerHdBadge(
+                        answered = call.answered,
+                        fallback = call.quality,
+                        qualityFlow = qualityFlow,
+                    )
                 }
                 Spacer(Modifier.height(2.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -383,5 +376,31 @@ private fun BannerActionCircle(
             tint = iconTint,
             modifier = Modifier.size(18.dp),
         )
+    }
+}
+
+@Composable
+private fun BannerHdBadge(
+    answered: Boolean,
+    fallback: CallQuality?,
+    qualityFlow: StateFlow<CallQuality?>?,
+) {
+    val live = qualityFlow?.collectAsStateWithLifecycle()?.value
+    val q = live ?: fallback
+    if (q?.isHdVoice == true && answered) {
+        Spacer(Modifier.width(6.dp))
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(5.dp))
+                .background(Color(0x338AB4F8))
+                .padding(horizontal = 5.dp, vertical = 1.dp),
+        ) {
+            Text(
+                text = "HD",
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFFB3D1FF),
+            )
+        }
     }
 }

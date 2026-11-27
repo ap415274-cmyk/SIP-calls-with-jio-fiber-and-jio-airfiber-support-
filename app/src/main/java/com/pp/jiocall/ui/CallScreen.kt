@@ -72,14 +72,17 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.pp.jiocall.R
 import com.pp.jiocall.data.PhoneUtils
+import com.pp.jiocall.sip.CallQuality
 import com.pp.jiocall.sip.CallSnapshot
 import com.pp.jiocall.sip.CallState
 import com.pp.jiocall.ui.components.ContactAvatar
 import com.pp.jiocall.ui.components.IncomingSlideControlBar
 import com.pp.jiocall.ui.components.OneUiIncomingAvatarHalo
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 
 private val DialpadKeys = listOf(
     listOf('1' to "", '2' to "ABC", '3' to "DEF"),
@@ -118,6 +121,7 @@ fun CallScreen(
     onDeclineWaiting: () -> Unit = {},
     onSwapCalls: () -> Unit = {},
     photoUri: String? = null,
+    qualityFlow: StateFlow<CallQuality?>? = null,
 ) {
     var showKeypad by remember { mutableStateOf(false) }
     var dtmfDigits by remember { mutableStateOf("") }
@@ -366,25 +370,12 @@ fun CallScreen(
                     color = statusColor,
                 )
 
-                // Optional HD Voice Pill
-                val q = call.quality
-                if (isCallActive && q != null) {
-                    Spacer(Modifier.width(10.dp))
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF1E2632))
-                            .border(1.dp, Color(0xFF2E3E52), RoundedCornerShape(8.dp))
-                            .padding(horizontal = 8.dp, vertical = 2.dp),
-                    ) {
-                        Text(
-                            text = if (q.isHdVoice) "HD" else q.codec,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFF8AB4F8),
-                        )
-                    }
-                }
+                // Optional HD Voice Pill (observes live quality locally without recomposing CallScreen)
+                CallCodecBadge(
+                    isCallActive = isCallActive,
+                    fallback = call.quality,
+                    qualityFlow = qualityFlow,
+                )
             }
 
             if (secondaryCall != null) {
@@ -1033,6 +1024,33 @@ private fun SecondaryCallBanner(
                     .background(Color(0x288AB4F8))
                     .clickable(onClick = onSwapCalls)
                     .padding(horizontal = 14.dp, vertical = 7.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun CallCodecBadge(
+    isCallActive: Boolean,
+    fallback: CallQuality?,
+    qualityFlow: StateFlow<CallQuality?>?,
+) {
+    val live = qualityFlow?.collectAsStateWithLifecycle()?.value
+    val q = live ?: fallback
+    if (isCallActive && q != null) {
+        Spacer(Modifier.width(10.dp))
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color(0xFF1E2632))
+                .border(1.dp, Color(0xFF2E3E52), RoundedCornerShape(8.dp))
+                .padding(horizontal = 8.dp, vertical = 2.dp),
+        ) {
+            Text(
+                text = if (q.isHdVoice) "HD" else q.codec,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF8AB4F8),
             )
         }
     }

@@ -80,6 +80,7 @@ class RtpAudio(
 
     private val jitterBuffer = RtpJitterBuffer()
     private val txFrameQueue = ArrayBlockingQueue<QueuedTxFrame>(16)
+    private val txFreeQueue = ArrayBlockingQueue<ShortArray>(16)
     private var audioController: CallAudioController? = null
     private var playbackEngine: AudioPlaybackEngine? = null
     private var captureEngine: AudioCaptureEngine? = null
@@ -234,6 +235,7 @@ class RtpAudio(
 
         // Start dedicated TX encode/send thread decoupled from AudioRecord HAL read thread
         txFrameQueue.clear()
+        txFreeQueue.clear()
         txThread = Thread(::encodeAndSendLoop, "JioCall-TX-Encode").apply {
             priority = Thread.MAX_PRIORITY
             start()
@@ -347,6 +349,7 @@ class RtpAudio(
         val txt = txThread
         txThread = null
         txFrameQueue.clear()
+        txFreeQueue.clear()
         if (txt != null && Thread.currentThread() !== txt) {
             runCatching { txt.join(350L) }
         }
@@ -381,22 +384,41 @@ class RtpAudio(
 
     private fun enqueueCapturedFrame(pcm: ShortArray, isMutedFrame: Boolean) {
         if (!running.get()) return
-        val copy = pcm.copyOf()
-        if (!txFrameQueue.offer(QueuedTxFrame(copy, isMutedFrame))) {
-            txFrameQueue.poll()
-            txFrameQueue.offer(QueuedTxFrame(copy, isMutedFrame))
+        val pooled = txFreeQueue.poll()
+        val copy = if (pooled != null && pooled.size == pcm.size) {
+            System.arraycopy(pcm, 0, pooled, 0, pcm.size)
+            pooled
+        } else {
+            pcm.copyOf()
+        }
+        val frame = QueuedTxFrame(copy, isMutedFrame)
+        if (!txFrameQueue.offer(frame)) {
+            val dropped = txFrameQueue.poll()
+            if (dropped != null) txFreeQueue.offer(dropped.pcm)
+            txFrameQueue.offer(frame)
         }
     }
 
     private fun encodeAndSendLoop() {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+        val rtpBuf = ByteArray(1500)
+        val rtpPkt = DatagramPacket(rtpBuf, rtpBuf.size)
         while (running.get()) {
             val item = runCatching { txFrameQueue.poll(40L, TimeUnit.MILLISECONDS) }.getOrNull() ?: continue
-            processAndSendFrame(item.pcm, item.muted)
+            try {
+                processAndSendFrame(item.pcm, item.muted, rtpBuf, rtpPkt)
+            } finally {
+                txFreeQueue.offer(item.pcm)
+            }
         }
     }
 
-    private fun processAndSendFrame(pcm: ShortArray, isMutedFrame: Boolean) {
+    private fun processAndSendFrame(
+        pcm: ShortArray,
+        isMutedFrame: Boolean,
+        rtpBuf: ByteArray,
+        rtpPkt: DatagramPacket,
+    ) {
         if (!running.get()) return
         val addr = remoteAddr ?: return
         val targetPort = remotePort.takeIf { it > 0 } ?: return
@@ -428,7 +450,7 @@ class RtpAudio(
                 txTimestamp = (txTimestamp + txCodec.samplesPerFrame) and 0xFFFF_FFFFL
             }
             val count = packetsTx.incrementAndGet()
-            sendRtpPacket(addr, targetPort, txPayloadType, ts, payload, marker = count == 1L)
+            sendRtpPacket(addr, targetPort, txPayloadType, ts, payload, marker = count == 1L, rtpBuf = rtpBuf, rtpPkt = rtpPkt)
             if (count <= 2L || count % 250L == 0L) {
                 Log.i(TAG, "TX RTP: $count pkts (${txCodec.mime}, oa=$txOctetAligned, maxAmp=$lastTxPeak) -> $addr:$targetPort")
                 lastTxPeak = 0
@@ -506,15 +528,16 @@ class RtpAudio(
                     val unpacked = AmrFraming.unpackRtpFrames(buf, headerLen, payloadLen, codec == Codec.AMR_WB, oa)
                         ?: continue
                     if (unpacked.cmr in AmrEncoder.validModes(codec)) {
-                        txEncoder?.adaptToCmr(unpacked.cmr)
+                        txEncoder?.requestCmr(unpacked.cmr)
                     }
-                    unpacked.frames.forEachIndexed { idx, amrFrame ->
+                    val frames = unpacked.frames
+                    for (idx in frames.indices) {
                         jitterBuffer.push(
                             RtpJitterBuffer.Packet(
                                 seq = (seq + idx) and 0xFFFF,
                                 timestamp = (ts + idx.toLong() * codec.samplesPerFrame) and 0xFFFF_FFFFL,
                                 codec = codec,
-                                frame = amrFrame,
+                                frame = frames[idx],
                             ),
                         )
                     }
@@ -552,6 +575,8 @@ class RtpAudio(
         timestamp: Long,
         payload: ByteArray,
         marker: Boolean = false,
+        rtpBuf: ByteArray? = null,
+        rtpPkt: DatagramPacket? = null,
     ) {
         val sock = socket ?: return
         val seq: Int
@@ -559,7 +584,8 @@ class RtpAudio(
             seq = txSeq and 0xFFFF
             txSeq = (txSeq + 1) and 0xFFFF
         }
-        val pkt = ByteArray(12 + payload.size)
+        val totalLen = 12 + payload.size
+        val pkt = if (rtpBuf != null && totalLen <= rtpBuf.size) rtpBuf else ByteArray(totalLen)
         pkt[0] = 0x80.toByte()
         pkt[1] = ((if (marker) 0x80 else 0x00) or (payloadType and 0x7F)).toByte()
         pkt[2] = ((seq ushr 8) and 0xFF).toByte()
@@ -573,7 +599,15 @@ class RtpAudio(
         pkt[10] = ((ssrc ushr 8) and 0xFF).toByte()
         pkt[11] = (ssrc and 0xFF).toByte()
         System.arraycopy(payload, 0, pkt, 12, payload.size)
-        runCatching { sock.send(DatagramPacket(pkt, pkt.size, addr, port)) }
+        val datagram = if (rtpPkt != null && pkt === rtpBuf) {
+            rtpPkt.setData(pkt, 0, totalLen)
+            rtpPkt.address = addr
+            rtpPkt.port = port
+            rtpPkt
+        } else {
+            DatagramPacket(pkt, totalLen, addr, port)
+        }
+        runCatching { sock.send(datagram) }
     }
 
     companion object {

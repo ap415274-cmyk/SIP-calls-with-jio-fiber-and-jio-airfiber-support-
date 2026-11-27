@@ -10,6 +10,7 @@ import android.util.Log
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Coordinates the Android communication audio session for a single call:
@@ -33,8 +34,10 @@ internal class CallAudioController(private val context: Context) {
     private var commDeviceListener: AudioManager.OnCommunicationDeviceChangedListener? = null
     private var previousMode: Int = AudioManager.MODE_NORMAL
     @Volatile private var speakerPreferred: Boolean = false
+    @Volatile private var sessionToken: Long = 0L
 
     fun acquireSession(speakerOn: Boolean) {
+        sessionToken = activeSessionToken.incrementAndGet()
         speakerPreferred = speakerOn
         val am = audioManager ?: return
 
@@ -74,6 +77,15 @@ internal class CallAudioController(private val context: Context) {
                 runCatching { am.removeOnCommunicationDeviceChangedListener(listener) }
             }
             commDeviceListener = null
+        }
+
+        // Only reset global AudioManager routing/mode if a newer call hasn't acquired an active session.
+        if (activeSessionToken.get() != sessionToken) {
+            abandonAudioFocus(am)
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             runCatching { am.clearCommunicationDevice() }
         } else {
             @Suppress("DEPRECATION")
@@ -179,6 +191,7 @@ internal class CallAudioController(private val context: Context) {
 
     companion object {
         private const val TAG = "CallAudioController"
+        private val activeSessionToken = AtomicLong(0L)
 
         private val EXTERNAL_HEADSET_TYPES = setOf(
             AudioDeviceInfo.TYPE_WIRED_HEADSET,
