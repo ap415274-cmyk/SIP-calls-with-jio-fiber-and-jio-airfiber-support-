@@ -30,3 +30,8 @@ local.properties
 /*.log
 /*.txt
 /*.py
+
+# Release signing secrets (keep private keys out of git)
+*.jks
+*.keystore
+/keystore.properties

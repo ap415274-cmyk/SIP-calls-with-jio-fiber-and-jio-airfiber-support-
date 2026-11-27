@@ -87,6 +87,10 @@ app/src/main/java/com/pp/jiocall/
 
 ## Getting Started
 
+### Download Prebuilt Release APK
+- Prebuilt signed release APK: [`releases/JioCall-v1.0-release.apk`](releases/JioCall-v1.0-release.apk) (R8-minified, APK Signature Scheme v2).
+- Automated CI builds and tagged releases are published under the repository's **Releases** tab via [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
 ### 1. Clone the repository
 ```bash
 git clone https://github.com/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-.git
@@ -100,7 +104,9 @@ Open in Android Studio, or build from the command line:
 # Build debug APK
 ./gradlew assembleDebug
 
-# Build minified release APK (unsigned; configure signing in app/build.gradle.kts before sideloading release)
+# Build minified release APK
+# Signs automatically if local keystore.properties or RELEASE_KEYSTORE_* env vars are set;
+# otherwise outputs an unsigned release APK.
 ./gradlew assembleRelease
 
 # Install debug build on connected device or emulator
@@ -108,6 +114,14 @@ Open in Android Studio, or build from the command line:
 ```
 
 On Windows PowerShell, use `.\gradlew.bat` instead of `./gradlew` (with `JAVA_HOME` pointing to your JDK 17+/Android Studio JBR).
+
+<details>
+<summary>Optional: Configure release signing (local or GitHub Actions)</summary>
+
+- **Local builds**: create a gitignored `keystore.properties` in the project root with `storeFile`, `storePassword`, `keyAlias`, and `keyPassword`.
+- **GitHub Actions**: configure repository secrets `RELEASE_KEYSTORE_BASE64`, `RELEASE_KEYSTORE_PASSWORD`, `RELEASE_KEY_ALIAS`, and `RELEASE_KEY_PASSWORD` so tagged workflows (`v*`) attach a signed APK automatically.
+
+</details>
 
 ### 3. Quick Setup in App
 1. Ensure your Android device is connected to your **JioFiber / JioAirFiber** Wi-Fi network (or VPN/LAN reaching a SIP server).
