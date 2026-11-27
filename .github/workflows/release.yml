@@ -37,7 +37,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
 
       - name: Run unit tests & lint
-        run: ./gradlew testDebugUnitTest lintDebug --no-daemon
+        run: |
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest lintDebug --no-daemon
 
       - name: Decode release keystore (if configured)
         env:
