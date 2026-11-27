@@ -16,19 +16,25 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '25'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          SDKMANAGER=$(command -v sdkmanager || find "$SDK_ROOT" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          fi
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       - name: Run unit tests & lint
         run: ./gradlew testDebugUnitTest lintDebug --no-daemon
@@ -57,6 +63,9 @@ jobs:
           if [ -f app/build/outputs/apk/release/app-release.apk ]; then
             OUT="build-artifacts/JioCall-${VERSION_TAG}-release.apk"
             cp app/build/outputs/apk/release/app-release.apk "$OUT"
+          elif [ -f "releases/JioCall-${VERSION_TAG}-release.apk" ]; then
+            OUT="build-artifacts/JioCall-${VERSION_TAG}-release.apk"
+            cp "releases/JioCall-${VERSION_TAG}-release.apk" "$OUT"
           else
             OUT="build-artifacts/JioCall-${VERSION_TAG}-release-unsigned.apk"
             cp app/build/outputs/apk/release/app-release-unsigned.apk "$OUT"
@@ -65,7 +74,7 @@ jobs:
           ls -lh "$OUT"
 
       - name: Upload APK workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jiocall-release-apk
           path: ${{ steps.apk.outputs.apk_path }}
@@ -80,13 +89,13 @@ jobs:
 
     steps:
       - name: Download release APK artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: jiocall-release-apk
           path: release-assets
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: release-assets/*.apk
