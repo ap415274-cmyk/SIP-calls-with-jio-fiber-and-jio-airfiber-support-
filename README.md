@@ -8,10 +8,10 @@
 
 *Open-source JioJoin alternative built in 100% pure Kotlin & Jetpack Compose — make and receive HD Voice (`AMR-WB`) landline calls from your Android phone over Wi-Fi.*
 
-[![Latest Release](https://img.shields.io/github/v/release/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-?label=Release&color=1A73E8&style=flat-square)](https://github.com/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-/releases/latest)
-[![GitHub Downloads](https://img.shields.io/github/downloads/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-/total?label=Downloads&color=2E7D32&style=flat-square)](https://github.com/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-/releases)
-[![Android CI](https://img.shields.io/github/actions/workflow/status/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-/release.yml?branch=main&label=CI%20Build&style=flat-square)](https://github.com/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-/actions)
-[![License](https://img.shields.io/github/license/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-?color=blue&style=flat-square)](LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/ap415274-cmyk/JioCall?label=Release&color=1A73E8&style=flat-square)](https://github.com/ap415274-cmyk/JioCall/releases/latest)
+[![GitHub Downloads](https://img.shields.io/github/downloads/ap415274-cmyk/JioCall/total?label=Downloads&color=2E7D32&style=flat-square)](https://github.com/ap415274-cmyk/JioCall/releases)
+[![Android CI](https://img.shields.io/github/actions/workflow/status/ap415274-cmyk/JioCall/release.yml?branch=main&label=CI%20Build&style=flat-square)](https://github.com/ap415274-cmyk/JioCall/actions)
+[![License](https://img.shields.io/github/license/ap415274-cmyk/JioCall?color=blue&style=flat-square)](LICENSE)
 
 [![Android API](https://img.shields.io/badge/Android-9.0%2B%20(API%2028)-3DDC84?style=flat-square&logo=android&logoColor=white)](app/build.gradle.kts)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?style=flat-square&logo=kotlin&logoColor=white)](gradle/libs.versions.toml)
@@ -36,7 +36,7 @@
 
 ## Download & Install
 
-1. Download the signed release APK from [**GitHub Releases**](https://github.com/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-/releases/latest) (or directly from [`releases/JioCall-v1.0-release.apk`](releases/JioCall-v1.0-release.apk)).
+1. Download the signed release APK from [**GitHub Releases**](https://github.com/ap415274-cmyk/JioCall/releases/latest) (or directly from [`releases/JioCall-v1.1-release.apk`](releases/JioCall-v1.1-release.apk)).
 2. Install on Android **9.0 (API 28)** or newer.
 3. Connect to your **JioFiber / JioAirFiber** Wi-Fi network, open the app menu -> **Connect JioFiber/AirFiber**, and choose:
    - **Temporary (`eth`)**: Instant setup with no OTP (credentials auto-renew when needed).
@@ -143,8 +143,8 @@ app/src/main/java/com/pp/jiocall/
 
 ### Clone & Build
 ```bash
-git clone https://github.com/ap415274-cmyk/SIP-calls-with-jio-fiber-and-jio-airfiber-support-.git
-cd SIP-calls-with-jio-fiber-and-jio-airfiber-support-
+git clone https://github.com/ap415274-cmyk/JioCall.git
+cd JioCall
 
 # Build debug APK
 ./gradlew assembleDebug

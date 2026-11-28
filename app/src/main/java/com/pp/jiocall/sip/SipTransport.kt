@@ -34,6 +34,14 @@ internal class SipTransport(
         private set
     @Volatile var localPort: Int = 0
         private set
+    @Volatile var lastRxMs: Long = 0L
+        private set
+    @Volatile var lastTxMs: Long = 0L
+        private set
+
+    internal fun markIdleForTesting(idleMs: Long) {
+        lastRxMs = (elapsedOrWallMs() - idleMs).coerceAtLeast(1L)
+    }
 
     private var datagram: DatagramSocket? = null
     private var stream: Socket? = null
@@ -42,8 +50,13 @@ internal class SipTransport(
     private var remoteAddress: InetAddress? = null
     private val outbox = java.util.concurrent.LinkedBlockingQueue<String>()
 
+    fun isClosed(): Boolean = closed.get()
+
     @Throws(Exception::class)
     fun connect() {
+        val now = elapsedOrWallMs()
+        lastRxMs = now
+        lastTxMs = now
         val all = runCatching { InetAddress.getAllByName(host) }.getOrNull().orEmpty()
         val address = all.firstOrNull { it is java.net.Inet4Address }
             ?: all.firstOrNull()
@@ -96,9 +109,9 @@ internal class SipTransport(
     }
 
     /** Queues a message; the sip-tx thread owns every write. Never blocks. */
-    fun send(text: String) {
-        if (text.isEmpty() || closed.get()) return
-        outbox.offer(text)
+    fun send(text: String): Boolean {
+        if (text.isEmpty() || closed.get()) return false
+        return outbox.offer(text)
     }
 
     /** Waits (bounded) for queued messages to reach the socket. */
@@ -133,6 +146,7 @@ internal class SipTransport(
                     val socket = datagram ?: return
                     val address = remoteAddress ?: return
                     runCatching { socket.send(DatagramPacket(bytes, bytes.size, address, port)) }
+                        .onSuccess { lastTxMs = elapsedOrWallMs() }
                         .onFailure { Log.w(TAG, "send failed", it) }
                 }
 
@@ -141,6 +155,8 @@ internal class SipTransport(
                     val sent = runCatching {
                         out.write(bytes)
                         out.flush()
+                    }.onSuccess {
+                        lastTxMs = elapsedOrWallMs()
                     }.onFailure { Log.w(TAG, "send failed", it) }
                     if (sent.isFailure) {
                         if (!closed.get()) onClosed(sent.exceptionOrNull()?.message ?: "connection lost")
@@ -163,6 +179,7 @@ internal class SipTransport(
             val packet = DatagramPacket(buffer, buffer.size)
             val read = runCatching { socket.receive(packet) }
             if (read.isFailure) break
+            lastRxMs = elapsedOrWallMs()
             val text = String(packet.data, 0, packet.length, Charsets.UTF_8)
             deliver(text)
         }
@@ -178,6 +195,7 @@ internal class SipTransport(
                 .onFailure { failure = it.message ?: it.javaClass.simpleName }
                 .getOrElse { -1 }
             if (read < 0) break
+            lastRxMs = elapsedOrWallMs()
             pending.write(buffer, 0, read)
             val rawData = pending.toByteArray()
             var cursor = 0
@@ -259,4 +277,13 @@ internal class SipTransport(
         context.init(null, arrayOf<TrustManager>(trustAllManager), null)
         return context.socketFactory
     }
+}
+
+/**
+ * Returns elapsed time since boot (which keeps advancing across Android deep sleep / Doze),
+ * falling back to wall-clock epoch ms in JVM unit tests where `SystemClock` is stubbed.
+ */
+internal fun elapsedOrWallMs(): Long {
+    val elapsed = runCatching { android.os.SystemClock.elapsedRealtime() }.getOrDefault(0L)
+    return if (elapsed > 0L) elapsed else System.currentTimeMillis()
 }

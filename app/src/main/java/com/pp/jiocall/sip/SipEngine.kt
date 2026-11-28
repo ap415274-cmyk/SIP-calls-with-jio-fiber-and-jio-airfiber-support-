@@ -28,7 +28,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
-data class AccountStatus(val state: RegState, val reason: String? = null)
+data class AccountStatus(val state: RegState, val reason: String? = null, val code: Int = 0)
 
 /** What the UI shows about the call in progress. */
 data class CallSnapshot(
@@ -71,6 +71,8 @@ class SipEngine(private val context: Context, private val store: Store) {
     private var secondary: SipCall? = null
     private val locallyDeclinedCallIds = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var speakerOn = false
+
+    var onCredentialRefresh: (suspend (accountId: Long, force: Boolean) -> Unit)? = null
 
     val statuses = MutableStateFlow<Map<Long, AccountStatus>>(emptyMap())
     val call = MutableStateFlow<CallSnapshot?>(null)
@@ -118,9 +120,9 @@ class SipEngine(private val context: Context, private val store: Store) {
             val start = mutableListOf<Account>()
             for (account in wanted) {
                 val existing = agents[account.id]
-                if (existing != null && existing.account.sameAs(account)) {
-                    // Only the credentials' expiry moved (or the router rotated
-                    // them): keep the live connection instead of reconnecting.
+                if (existing != null && canUpdateInPlace(existing, account)) {
+                    // Keep the live SipAccount (and any recovering/active calls) intact while
+                    // updateAccount applies rotated router credentials or setting changes.
                     existing.updateAccount(account)
                     continue
                 }
@@ -143,6 +145,9 @@ class SipEngine(private val context: Context, private val store: Store) {
                 onRegistration = ::onRegistration,
                 onIncoming = ::onIncoming,
                 onCallUpdate = ::onCallUpdate,
+                onCredentialRefreshRequested = { accountId, force ->
+                    onCredentialRefresh?.invoke(accountId, force)
+                },
             )
             agents[account.id] = agent
             agent.start()
@@ -189,7 +194,8 @@ class SipEngine(private val context: Context, private val store: Store) {
         }
         if (call.state == CallState.ENDED || call.state == CallState.FAILED) {
             // It failed before we could take it over; report the reason instead
-            // of leaving a dead call where the next dial looks like a busy line.
+            // of leaving a dead call or stuck ongoing notification.
+            CallService.update(context, context.getString(com.pp.jiocall.R.string.app_name), "Ready")
             return call.error ?: "Call failed"
         }
         active = call
@@ -386,12 +392,33 @@ class SipEngine(private val context: Context, private val store: Store) {
         active?.let { agentFor(it)?.sendDtmf(it, digit) }
     }
 
+    /**
+     * Checks all enabled SIP accounts and recovers any stale transport or expired registration.
+     */
+    fun ensureHealthyRegistration(forceProbe: Boolean = false) {
+        forEachAgent { it.ensureHealthyRegistration(forceProbe) }
+    }
+
+    /**
+     * Suspends until every enabled SIP account finishes any triggered recovery/registration check.
+     */
+    suspend fun ensureHealthyRegistrationAndWait(forceProbe: Boolean = false) {
+        val currentAgents = synchronized(lock) { agents.values.toList() }
+        currentAgents.forEach { agent ->
+            runCatching { agent.ensureHealthyRegistrationAndWait(forceProbe = forceProbe) }
+        }
+    }
+
     fun onNetworkChanged() {
+        forEachAgent { it.onNetworkChanged() }
+    }
+
+    private fun forEachAgent(action: suspend (SipAccount) -> Unit) {
         val currentAgents = synchronized(lock) { agents.values.toList() }
         if (currentAgents.isEmpty()) return
         scope.launch {
             currentAgents.forEach { agent ->
-                runCatching { agent.onNetworkChanged() }
+                runCatching { action(agent) }
             }
         }
     }
@@ -414,10 +441,22 @@ class SipEngine(private val context: Context, private val store: Store) {
         releaseProximityLock()
     }
 
+    private fun canUpdateInPlace(existing: SipAccount, incoming: Account): Boolean {
+        val current = existing.account
+        if (current.sameAs(incoming)) return true
+        if (active?.accountId == incoming.id || secondary?.accountId == incoming.id) return true
+        return current.provisioning != null &&
+            incoming.provisioning != null &&
+            current.server == incoming.server &&
+            current.proxy == incoming.proxy &&
+            current.domain == incoming.domain &&
+            current.transport == incoming.transport
+    }
+
     private fun agentFor(call: SipCall): SipAccount? = agents[call.accountId]
 
-    private fun onRegistration(agent: SipAccount, state: RegState, reason: String?) {
-        statuses.update { it + (agent.account.id to AccountStatus(state, reason)) }
+    private fun onRegistration(agent: SipAccount, state: RegState, reason: String?, code: Int) {
+        statuses.update { it + (agent.account.id to AccountStatus(state, reason, code)) }
     }
 
     private fun onIncoming(agent: SipAccount, call: SipCall) = synchronized(lock) {

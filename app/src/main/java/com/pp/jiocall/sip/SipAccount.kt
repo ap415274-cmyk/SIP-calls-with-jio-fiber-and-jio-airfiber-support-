@@ -56,6 +56,11 @@ class SipCall internal constructor(
     internal var authChallengeIsProxy: Boolean = false
     internal var authNonceCount: Int = 0
     internal var inviteAuthAttempts: Int = 0
+    internal var recoveryAttempts: Int = 0
+    @Volatile
+    internal var preparingInvite: Boolean = false
+    @Volatile
+    internal var gotSipResponse: Boolean = false
     internal var confirmed: Boolean = false
     /** CSeq of the most recent re-INVITE sent for hold/unhold. */
     internal var holdCseq: Long = 0L
@@ -77,9 +82,10 @@ class SipAccount(
     private val context: Context,
     initial: Account,
     private val settings: () -> AppSettings,
-    private val onRegistration: (SipAccount, RegState, String?) -> Unit,
+    private val onRegistration: (SipAccount, RegState, String?, Int) -> Unit,
     private val onIncoming: (SipAccount, SipCall) -> Unit,
     private val onCallUpdate: (SipAccount, SipCall) -> Unit,
+    private val onCredentialRefreshRequested: (suspend (accountId: Long, force: Boolean) -> Unit)? = null,
 ) {
     /** The last saved account; swapped in place when only its credentials moved. */
     var account: Account = initial
@@ -118,6 +124,16 @@ class SipAccount(
     private var failures = 0
     private var grantedExpires = 300
     @Volatile
+    private var lastRegisterOkMs = 0L
+    @Volatile
+    private var lastRegisterProbeMs = 0L
+    @Volatile
+    private var awaitingRegisterReply = false
+    @Volatile
+    private var lastRegCode = 0
+    @Volatile
+    private var pendingReconnectAfterCall = false
+    @Volatile
     private var registration = RegState.DISABLED
     private val cseq = AtomicLong(System.currentTimeMillis() % 100_000)
     @Volatile
@@ -135,6 +151,12 @@ class SipAccount(
             publish(RegState.FAILED, "Enter a server")
             return
         }
+        if (transport?.let { !it.isClosed() } == true && hasProtectedLiveCall()) {
+            Log.i("JioCall", "Deferring transport reconnect for ${account.title()} until active call finishes")
+            pendingReconnectAfterCall = true
+            reregisterInPlaceOnLiveTransport()
+            return
+        }
         val connection: SipTransport = synchronized(stateLock) {
             restartJob?.cancel()
             restartJob = null
@@ -148,6 +170,8 @@ class SipAccount(
             regNonceCount = 0
             regAuthAttempts = 0
             publish(RegState.REGISTERING, null)
+            lastRegCode = 0
+            awaitingRegisterReply = false
             lateinit var created: SipTransport
             created = SipTransport(
                 transport = account.transport,
@@ -181,11 +205,26 @@ class SipAccount(
      * (e.g. shortly after device reboot when Wi-Fi associates to JioFiber).
      */
     fun onNetworkChanged() {
+        ensureHealthyRegistration(forceProbe = true, allowOnActiveCall = true)
+    }
+
+    /**
+     * Verifies registration freshness and TCP/TLS socket health after Doze sleep, network hops,
+     * or foreground resume so long-lived idle sessions do not leave stale registrations behind.
+     */
+    fun ensureHealthyRegistration(forceProbe: Boolean = false, allowOnActiveCall: Boolean = false) {
         if (!account.enabled || !account.isUsable()) return
+        if (!allowOnActiveCall && calls.values.any { it.answered || it.state == CallState.DIALING || it.state == CallState.RINGING }) {
+            transport?.keepAlive()
+            return
+        }
         val activeIps = activeInterfaceIps()
         val (connection, state) = synchronized(stateLock) { transport to registration }
+        val needsRegistrar = account.server.trim().isNotEmpty()
+        val localIp = connection?.let { normalizeIp(it.localIp) }.orEmpty()
+        val isLoopbackLocal = localIp == "::1" || localIp == "0:0:0:0:0:0:0:1" || localIp.startsWith("127.")
         when {
-            connection == null || state == RegState.FAILED || state == RegState.UNREGISTERED -> {
+            connection == null || connection.isClosed() || state == RegState.FAILED || state == RegState.UNREGISTERED -> {
                 synchronized(stateLock) {
                     failures = 0
                     restartJob?.cancel()
@@ -193,7 +232,7 @@ class SipAccount(
                 }
                 start()
             }
-            connection.localIp.isNotEmpty() && activeIps.isNotEmpty() && normalizeIp(connection.localIp) !in activeIps -> {
+            localIp.isNotEmpty() && !isLoopbackLocal && activeIps.isNotEmpty() && localIp !in activeIps -> {
                 synchronized(stateLock) {
                     failures = 0
                     restartJob?.cancel()
@@ -201,13 +240,93 @@ class SipAccount(
                 }
                 start()
             }
-            state == RegState.REGISTERED -> {
+            connection.localIp.isEmpty() -> {
+                // Socket connect/TLS handshake in flight; start()'s onSuccess sends initial REGISTER.
+            }
+            state == RegState.REGISTERING && awaitingRegisterReply && (elapsedOrWallMs() - lastRegisterProbeMs) <= 15_000L -> {
+                // An initial or handshake REGISTER is already in flight and awaiting response.
+            }
+            needsRegistrar && lastRegisterOkMs > 0L && (elapsedOrWallMs() - lastRegisterOkMs) >= grantedExpires * 1_000L -> {
+                // Registration expired while Doze suspended coroutines; establish a clean socket + REGISTER.
+                Log.i("JioCall", "Registration expired during idle/sleep for ${account.title()}; reconnecting")
+                start()
+            }
+            needsRegistrar && isRegistrationStale(marginMs = 180_000L) -> {
+                scope.launch {
+                    if (sendRegister(account.registerRefresh.coerceIn(60, 3_600))) {
+                        armRegisterWatchdog(timeoutMs = 12_000L)
+                    } else {
+                        dropConnection("Transport unavailable", connection)
+                    }
+                }
+            }
+            forceProbe && account.transport != Transport.UDP && hasStaleTransport(idleThresholdMs = 300_000L) -> {
+                // Verify silent TLS/TCP connections after long idle periods instead of assuming socket liveness.
                 scope.launch {
                     connection.keepAlive()
-                    sendRegister(account.registerRefresh.coerceIn(60, 3_600))
+                    if (needsRegistrar) {
+                        if (sendRegister(account.registerRefresh.coerceIn(60, 3_600))) {
+                            armRegisterWatchdog(timeoutMs = 10_000L)
+                        } else {
+                            dropConnection("Transport unavailable", connection)
+                        }
+                    }
+                }
+            }
+            forceProbe && awaitingRegisterReply && (elapsedOrWallMs() - lastRegisterProbeMs) > 15_000L -> {
+                dropConnection("Registration stale after sleep", connection)
+            }
+            state == RegState.REGISTERED && forceProbe -> {
+                scope.launch {
+                    connection.keepAlive()
                 }
             }
         }
+    }
+
+    /**
+     * Triggers [ensureHealthyRegistration] and waits briefly for any initiated connect/REGISTER
+     * (including a Doze watchdog reconnect) to settle before releasing caller WakeLocks.
+     */
+    suspend fun ensureHealthyRegistrationAndWait(
+        forceProbe: Boolean = false,
+        allowOnActiveCall: Boolean = false,
+        timeoutMs: Long = 16_000L,
+    ) {
+        ensureHealthyRegistration(forceProbe = forceProbe, allowOnActiveCall = allowOnActiveCall)
+        if (!account.enabled || !account.isUsable()) return
+        val needsRegistrar = account.server.trim().isNotEmpty()
+        val deadline = elapsedOrWallMs() + timeoutMs
+        while (elapsedOrWallMs() < deadline && account.enabled) {
+            val conn = transport
+            val busy = awaitingRegisterReply ||
+                registration == RegState.REGISTERING ||
+                restartJob?.isActive == true ||
+                (conn != null && !conn.isClosed() && conn.localIp.isEmpty())
+            val doneRegistered = !needsRegistrar || (registration == RegState.REGISTERED && !isRegistrationStale(marginMs = 120_000L))
+            if (!busy && (doneRegistered || registration == RegState.DISABLED)) break
+            delay(50L)
+        }
+    }
+
+    internal fun isRegistrationStale(marginMs: Long = 120_000L): Boolean {
+        if (account.server.trim().isEmpty()) return false
+        if (registration != RegState.REGISTERED || lastRegisterOkMs <= 0L) return true
+        val refreshWindowMs = (grantedExpires * 1_000L - marginMs).coerceAtLeast(30_000L)
+        return (elapsedOrWallMs() - lastRegisterOkMs) >= refreshWindowMs
+    }
+
+    internal fun hasStaleTransport(idleThresholdMs: Long = 300_000L): Boolean {
+        val conn = transport ?: return true
+        if (conn.isClosed()) return true
+        if (account.transport == Transport.UDP) return false
+        val lastRx = conn.lastRxMs
+        return lastRx > 0L && (elapsedOrWallMs() - lastRx) >= idleThresholdMs
+    }
+
+    internal fun markStaleForTesting(idleMs: Long) {
+        transport?.markIdleForTesting(idleMs)
+        lastRegisterOkMs = (elapsedOrWallMs() - idleMs).coerceAtLeast(1L)
     }
 
     fun stop(unregister: Boolean = true) {
@@ -240,7 +359,7 @@ class SipAccount(
         publish(RegState.UNREGISTERED, null)
     }
 
-    /** New credentials from the router, without dropping the connection. */
+    /** New credentials from the router, without dropping the connection or any running call. */
     fun updateAccount(updated: Account) {
         val old = account
         account = updated
@@ -248,22 +367,53 @@ class SipAccount(
             stop()
             return
         }
-        val credentialsChanged = old.username != updated.username ||
-            old.password != updated.password ||
-            old.authId != updated.authId ||
-            old.server != updated.server ||
+        val endpointChanged = old.server != updated.server ||
             old.proxy != updated.proxy ||
             old.domain != updated.domain ||
             old.transport != updated.transport
+        val authChanged = old.username != updated.username ||
+            old.password != updated.password ||
+            old.authId != updated.authId
 
-        if (credentialsChanged || registration == RegState.FAILED || registration == RegState.UNREGISTERED || transport == null) {
+        if (hasProtectedLiveCall() && transport?.let { !it.isClosed() } == true) {
+            if (endpointChanged) {
+                Log.i("JioCall", "Endpoint changed during live call; deferring reconnect until hangup")
+                pendingReconnectAfterCall = true
+            } else {
+                Log.i("JioCall", "Refreshing SIP registration in-place during live call without closing dialog socket")
+                reregisterInPlaceOnLiveTransport()
+            }
+            return
+        }
+
+        if (endpointChanged || authChanged || registration == RegState.FAILED || registration == RegState.UNREGISTERED || transport == null) {
             start()
         } else {
-            failures = 0
-            regAuthAttempts = 0
-            regChallenge = null
-            regChallengeIsProxy = false
-            sendRegister(account.registerRefresh.coerceIn(60, 3_600))
+            reregisterInPlaceOnLiveTransport()
+        }
+    }
+
+    private fun hasProtectedLiveCall(): Boolean = calls.values.any {
+        it.answered ||
+            !it.outgoing ||
+            it.hasEarlyMedia ||
+            (it.outgoing && it.state == CallState.RINGING)
+    }
+
+    private fun reregisterInPlaceOnLiveTransport(): Boolean {
+        val conn = transport?.takeIf { !it.isClosed() && it.localIp.isNotEmpty() } ?: return false
+        failures = 0
+        regAuthAttempts = 0
+        regChallenge = null
+        regChallengeIsProxy = false
+        regNonceCount = 0
+        if (account.server.trim().isEmpty()) return true
+        return if (sendRegister(account.registerRefresh.coerceIn(60, 3_600))) {
+            armRegisterWatchdog(timeoutMs = 15_000L)
+            true
+        } else {
+            pendingReconnectAfterCall = true
+            false
         }
     }
 
@@ -285,9 +435,42 @@ class SipAccount(
             branch = "z9hG4bK" + randomTag(12)
         }
         calls[call.callId] = call
-        if (!sendInvite(call)) {
-            endWithError(call, "Not connected to ${account.host()}")
-            return call
+        val conn = transport
+        val needsRegistrar = account.server.trim().isNotEmpty()
+        val provisioningExpired = account.provisioning?.expiresAt?.let {
+            it - (System.currentTimeMillis() / 1000L) <= 60L
+        } ?: false
+        val needsRecovery = provisioningExpired ||
+            conn == null ||
+            conn.isClosed() ||
+            (needsRegistrar && registration != RegState.REGISTERED) ||
+            isRegistrationStale(marginMs = 120_000L) ||
+            hasStaleTransport(idleThresholdMs = 300_000L)
+
+        if (needsRecovery) {
+            call.preparingInvite = true
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val ready = ensureReadyForCall(forceCredentialRenew = provisioningExpired, timeoutMs = 10_000L)
+                    if (!calls.containsKey(call.callId) || call.state != CallState.DIALING) return@launch
+                    if (!ready) {
+                        endWithError(call, "Not connected to ${account.host()}")
+                        return@launch
+                    }
+                    if (!sendInvite(call)) {
+                        endWithError(call, "Not connected to ${account.host()}")
+                    }
+                } finally {
+                    call.preparingInvite = false
+                }
+            }
+        } else if (!sendInvite(call)) {
+            if (account.enabled && call.recoveryAttempts == 0) {
+                recoverAndRetryOutgoingCall(call, forceCredentialRenew = account.provisioning != null)
+            } else {
+                endWithError(call, "Not connected to ${account.host()}")
+                return call
+            }
         }
         notify(call)
         // A server that never answers must not leave the call dialing forever.
@@ -390,7 +573,7 @@ class SipAccount(
         if (call.state == CallState.ENDED || call.state == CallState.FAILED) return
         when {
             call.outgoing && (call.state == CallState.DIALING || call.state == CallState.RINGING) -> {
-                sendCancel(call)
+                if (call.lastInvite != null) sendCancel(call)
                 endCall(call, "Cancelled")
             }
 
@@ -528,10 +711,15 @@ class SipAccount(
         }
     }
 
-    private fun sendRegister(expires: Int) {
-        val connection = transport ?: return
+    private fun sendRegister(expires: Int): Boolean {
+        val connection = transport ?: return false
+        if (connection.isClosed()) return false
         regCseq.incrementAndGet()
-        connection.send(buildRegister(expires, connection))
+        if (expires > 0) {
+            awaitingRegisterReply = true
+            lastRegisterProbeMs = elapsedOrWallMs()
+        }
+        return connection.send(buildRegister(expires, connection))
     }
 
     private fun connectionEndpoint(connection: SipTransport): String {
@@ -575,16 +763,23 @@ class SipAccount(
     }
 
     private fun handleRegisterResponse(message: SipMessage) {
+        awaitingRegisterReply = false
+        registerWatchdog?.cancel()
+        lastRegCode = message.statusCode
         when {
             message.statusCode == 401 || message.statusCode == 407 -> {
                 regAuthAttempts++
                 if (regAuthAttempts > 2) {
-                    publish(RegState.FAILED, "Authentication rejected (${message.statusCode} ${message.reason})")
+                    publish(RegState.FAILED, "Authentication rejected (${message.statusCode} ${message.reason})", message.statusCode)
                     regChallenge = null
                     regChallengeIsProxy = false
                     regAuthAttempts = 0
+                    if (handleMidCallRegisterFailure(message.statusCode, triggerCredRefresh = true)) {
+                        return
+                    }
                     transport?.close()
                     transport = null
+                    scope.launch { onCredentialRefreshRequested?.invoke(account.id, false) }
                     scheduleRestart()
                     return
                 }
@@ -595,21 +790,23 @@ class SipAccount(
                 }
                 val challenge = header?.let { Digest.parseChallenge(it) }
                 if (challenge == null) {
-                    publish(RegState.FAILED, "The server's authentication challenge could not be read")
+                    publish(RegState.FAILED, "The server's authentication challenge could not be read", message.statusCode)
                     return
                 }
                 regChallenge = challenge
                 regChallengeIsProxy = message.statusCode == 407
                 regNonceCount = 0
                 sendRegister(account.registerRefresh.coerceIn(60, 3_600))
+                armRegisterWatchdog(timeoutMs = 15_000L)
             }
 
             message.statusCode in 200..299 -> {
                 failures = 0
+                pendingReconnectAfterCall = false
                 regAuthAttempts = 0
                 regChallenge = null
                 regChallengeIsProxy = false
-                registerWatchdog?.cancel()
+                lastRegisterOkMs = elapsedOrWallMs()
                 val contacts = message.headers("Contact")
                 val ownContact = contacts.firstOrNull { it.contains(instanceId, ignoreCase = true) }
                     ?: contacts.firstOrNull()
@@ -625,17 +822,32 @@ class SipAccount(
                 if (!received.isNullOrEmpty()) {
                     discoveredPublicAddr = received
                 }
-                publish(RegState.REGISTERED, null)
+                publish(RegState.REGISTERED, null, message.statusCode)
                 scheduleRefresh()
             }
 
             else -> {
-                publish(RegState.FAILED, "Registration failed (${message.statusCode} ${message.reason})")
+                publish(RegState.FAILED, "Registration failed (${message.statusCode} ${message.reason})", message.statusCode)
+                if (handleMidCallRegisterFailure(message.statusCode, triggerCredRefresh = message.statusCode == 403)) {
+                    return
+                }
                 transport?.close()
                 transport = null
+                if (message.statusCode == 403) {
+                    scope.launch { onCredentialRefreshRequested?.invoke(account.id, false) }
+                }
                 scheduleRestart()
             }
         }
+    }
+
+    private fun handleMidCallRegisterFailure(statusCode: Int, triggerCredRefresh: Boolean): Boolean {
+        if (!hasProtectedLiveCall()) return false
+        pendingReconnectAfterCall = true
+        if (triggerCredRefresh) {
+            scope.launch { onCredentialRefreshRequested?.invoke(account.id, false) }
+        }
+        return true
     }
 
     private fun scheduleRefresh() {
@@ -643,13 +855,18 @@ class SipAccount(
         val seconds = (grantedExpires * 9 / 10).coerceAtLeast(30)
         regJob = scope.launch {
             delay(seconds * 1_000L)
-            sendRegister(account.registerRefresh.coerceIn(60, 3_600))
+            if (!account.enabled || registration == RegState.DISABLED) return@launch
+            if (sendRegister(account.registerRefresh.coerceIn(60, 3_600))) {
+                armRegisterWatchdog(timeoutMs = 15_000L)
+            } else {
+                dropConnection("Transport unavailable", transport)
+            }
         }
     }
 
-    private fun publish(state: RegState, reason: String?) {
+    private fun publish(state: RegState, reason: String?, code: Int = 0) {
         registration = state
-        runCatching { onRegistration(this, state, reason) }
+        runCatching { onRegistration(this, state, reason, code) }
     }
 
     private fun dropConnection(reason: String, closing: SipTransport? = transport) {
@@ -659,6 +876,7 @@ class SipAccount(
                 false
             } else {
                 transport = null
+                awaitingRegisterReply = false
                 registerWatchdog?.cancel()
                 registerWatchdog = null
                 true
@@ -667,7 +885,15 @@ class SipAccount(
         connection.close()
         if (!isCurrent) return
         publish(RegState.FAILED, reason)
-        calls.values.toList().forEach { endCall(it, reason) }
+        val liveCalls = calls.values.toList()
+        for (call in liveCalls) {
+            if (call.preparingInvite) continue
+            if (call.outgoing && call.state == CallState.DIALING && !call.confirmed && !call.hasEarlyMedia && call.recoveryAttempts == 0) {
+                recoverAndRetryOutgoingCall(call, forceCredentialRenew = account.provisioning != null)
+            } else {
+                endCall(call, reason)
+            }
+        }
         scheduleRestart()
     }
 
@@ -695,12 +921,107 @@ class SipAccount(
         ip.trim().removePrefix("[").substringBefore("]").substringBefore('%')
 
     /** A REGISTER that never gets an answer must not leave the agent stuck. */
-    private fun armRegisterWatchdog() {
+    private fun armRegisterWatchdog(timeoutMs: Long = 35_000L) {
         registerWatchdog?.cancel()
+        val watched = transport ?: return
         registerWatchdog = scope.launch {
-            delay(35_000)
-            if (registration != RegState.REGISTERED && transport != null) {
-                dropConnection("No answer from ${account.server.trim().ifEmpty { account.host() }}")
+            delay(timeoutMs)
+            if (awaitingRegisterReply && transport === watched) {
+                dropConnection("No answer from ${account.server.trim().ifEmpty { account.host() }}", watched)
+            }
+        }
+    }
+
+    private suspend fun ensureReadyForCall(forceCredentialRenew: Boolean, timeoutMs: Long = 10_000L): Boolean {
+        if (!account.enabled || !account.isUsable()) return false
+        val beforeConn = transport
+        val beforePass = account.password
+        runCatching { onCredentialRefreshRequested?.invoke(account.id, forceCredentialRenew) }
+        val updatedInPlace = transport !== beforeConn || account.password != beforePass
+
+        val needsRegistrar = account.server.trim().isNotEmpty()
+        if (!updatedInPlace) {
+            val conn = transport
+            val connectInFlight = registration == RegState.REGISTERING &&
+                conn != null &&
+                !conn.isClosed() &&
+                (conn.localIp.isEmpty() || awaitingRegisterReply)
+            val shouldStartFresh = forceCredentialRenew ||
+                conn == null ||
+                conn.isClosed() ||
+                registration == RegState.FAILED ||
+                registration == RegState.UNREGISTERED ||
+                hasStaleTransport(idleThresholdMs = 300_000L) ||
+                (needsRegistrar && lastRegisterOkMs > 0L && (elapsedOrWallMs() - lastRegisterOkMs) >= grantedExpires * 1_000L)
+            if (shouldStartFresh) {
+                synchronized(stateLock) {
+                    failures = 0
+                    restartJob?.cancel()
+                    restartJob = null
+                }
+                start()
+            } else if (needsRegistrar && !connectInFlight &&
+                (registration != RegState.REGISTERED || isRegistrationStale(marginMs = 120_000L))
+            ) {
+                if (sendRegister(account.registerRefresh.coerceIn(60, 3_600))) {
+                    armRegisterWatchdog(timeoutMs = 10_000L)
+                } else {
+                    start()
+                }
+            }
+        }
+
+        val deadline = elapsedOrWallMs() + timeoutMs
+        var retriedAuth = forceCredentialRenew
+        while (elapsedOrWallMs() < deadline && account.enabled) {
+            val curConn = transport
+            val ready = curConn != null &&
+                !curConn.isClosed() &&
+                curConn.localIp.isNotEmpty() &&
+                (!needsRegistrar || (registration == RegState.REGISTERED && !isRegistrationStale(marginMs = 60_000L) && !awaitingRegisterReply))
+            if (ready) return true
+
+            if (registration == RegState.FAILED && !retriedAuth && account.provisioning != null &&
+                (lastRegCode == 401 || lastRegCode == 403 || lastRegCode == 407)
+            ) {
+                retriedAuth = true
+                runCatching { onCredentialRefreshRequested?.invoke(account.id, true) }
+                if (transport == null || transport?.isClosed() == true) start()
+            }
+            delay(50L)
+        }
+        val finalConn = transport
+        return finalConn != null && !finalConn.isClosed() && (!needsRegistrar || registration == RegState.REGISTERED)
+    }
+
+    private fun recoverAndRetryOutgoingCall(call: SipCall, forceCredentialRenew: Boolean) {
+        if (call.recoveryAttempts > 0 || call.state != CallState.DIALING || call.confirmed || call.hasEarlyMedia) {
+            return
+        }
+        call.recoveryAttempts += 1
+        call.preparingInvite = true
+        scope.launch(Dispatchers.IO) {
+            try {
+                val ready = ensureReadyForCall(forceCredentialRenew = forceCredentialRenew, timeoutMs = 10_000L)
+                if (!calls.containsKey(call.callId) || call.state != CallState.DIALING) return@launch
+                if (!ready) {
+                    endWithError(call, "Not connected to ${account.host()}")
+                    return@launch
+                }
+                synchronized(call) {
+                    call.gotSipResponse = false
+                    call.authChallenge = null
+                    call.authNonceCount = 0
+                    call.inviteAuthAttempts = 0
+                    call.inviteCseq += 1
+                    call.dialogCseq = call.inviteCseq
+                    call.branch = "z9hG4bK" + randomTag(12)
+                }
+                if (!sendInvite(call)) {
+                    endWithError(call, "Not connected to ${account.host()}")
+                }
+            } finally {
+                call.preparingInvite = false
             }
         }
     }
@@ -778,12 +1099,19 @@ class SipAccount(
     private fun handleCallResponse(message: SipMessage) {
         val call = calls[message.callId()] ?: return
         when (message.cseqMethod()) {
-            "INVITE" -> when {
+            "INVITE" -> {
+                if (message.statusCode >= 100) call.gotSipResponse = true
+                when {
                 message.statusCode == 401 || message.statusCode == 407 -> {
                     sendNon2xxAck(call, message)
                     call.inviteAuthAttempts++
                     if (call.inviteAuthAttempts > 2) {
-                        endCall(call, "Call authentication failed (${message.statusCode} ${message.reason})")
+                        if (call.outgoing && call.state == CallState.DIALING && call.recoveryAttempts == 0 && account.provisioning != null) {
+                            Log.i("JioCall", "INVITE auth rejected (${message.statusCode}); refreshing credentials and retrying once")
+                            recoverAndRetryOutgoingCall(call, forceCredentialRenew = true)
+                        } else {
+                            endCall(call, "Call authentication failed (${message.statusCode} ${message.reason})")
+                        }
                         return
                     }
                     val header = if (message.statusCode == 401) {
@@ -864,10 +1192,22 @@ class SipAccount(
                 message.statusCode >= 300 -> {
                     ToneGenerator.stopRingback()
                     sendNon2xxAck(call, message)
+                    if (message.statusCode == 403 &&
+                        call.outgoing &&
+                        call.state == CallState.DIALING &&
+                        !call.confirmed &&
+                        !call.hasEarlyMedia &&
+                        call.recoveryAttempts == 0
+                    ) {
+                        Log.i("JioCall", "INVITE got 403 Forbidden; re-registering/renewing credentials and retrying once")
+                        recoverAndRetryOutgoingCall(call, forceCredentialRenew = account.provisioning != null)
+                        return
+                    }
                     if (message.statusCode == 486 || message.statusCode == 600 || message.statusCode == 480) {
                         ToneGenerator.playBusyTone()
                     }
                     endCall(call, "Call failed (${message.statusCode} ${message.reason})")
+                }
                 }
             }
 
@@ -1109,14 +1449,42 @@ class SipAccount(
     private fun sendInvite(call: SipCall): Boolean {
         val media = call.media ?: return false
         val connection = transport ?: return false
+        if (connection.isClosed()) return false
         val address = advertisedAddress(media)
         val body = Sdp.offer(address, media.port, CodecSupport.offer(settings().codecs()), System.currentTimeMillis())
         val request = buildInvite(call, body)
         if (debugLogEnabled) Log.i("JioCall", "sending INVITE:\n$request")
         call.lastInvite = request
-        return runCatching { connection.send(request) }
-            .onFailure { Log.w("JioCall", "INVITE could not be sent", it) }
-            .isSuccess
+        val queued = connection.send(request)
+        if (!queued) {
+            Log.w("JioCall", "INVITE could not be queued (transport closed)")
+            return false
+        }
+        armInviteBlackHoleWatchdog(call, connection)
+        return true
+    }
+
+    private fun armInviteBlackHoleWatchdog(call: SipCall, connection: SipTransport) {
+        if (account.transport == Transport.UDP || call.recoveryAttempts > 0) return
+        scope.launch {
+            delay(5_000L)
+            if (calls.containsKey(call.callId) &&
+                call.outgoing &&
+                call.state == CallState.DIALING &&
+                !call.gotSipResponse &&
+                !call.preparingInvite &&
+                !call.confirmed &&
+                !call.hasEarlyMedia &&
+                call.recoveryAttempts == 0 &&
+                transport === connection
+            ) {
+                Log.w(
+                    "JioCall",
+                    "No SIP response (100 Trying) within 5s on ${account.transport}; dropping stale socket and retrying call",
+                )
+                dropConnection("No SIP response from ${account.host()}", connection)
+            }
+        }
     }
 
     private fun resendInvite(call: SipCall) {
@@ -1489,6 +1857,10 @@ class SipAccount(
         if (call.error == null) call.error = reason
         calls.remove(call.callId)
         notify(call)
+        if (pendingReconnectAfterCall && !hasProtectedLiveCall() && calls.isEmpty() && account.enabled) {
+            pendingReconnectAfterCall = false
+            scope.launch { ensureHealthyRegistration(forceProbe = true) }
+        }
     }
 
     private fun endWithError(call: SipCall, reason: String) {

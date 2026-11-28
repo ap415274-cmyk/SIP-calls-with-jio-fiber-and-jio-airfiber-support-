@@ -9,7 +9,6 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.UserManager
@@ -38,6 +37,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
@@ -71,18 +72,23 @@ class App : Application() {
     private var lastStatusText: String? = null
     private var engineStarted = false
     private val cooldownUntil = ConcurrentHashMap<Long, Long>()
+    private val lastRenewSuccessAt = ConcurrentHashMap<Long, Long>()
+    private val renewMutex = Mutex()
 
-    val deviceName: String by lazy {
-        val model = Build.MODEL.trim()
-        val brand = Build.BRAND.replaceFirstChar { it.uppercase() }
-        if (model.startsWith(brand, ignoreCase = true)) model else "$brand $model"
-    }
+    val deviceName: String by lazy { JioClient.defaultDeviceName() }
 
     override fun onCreate() {
         super.onCreate()
         store = Store(this)
         engine = SipEngine(this, store)
         jio = JioClient(this)
+        engine.onCredentialRefresh = { accountId, force ->
+            refreshStaleCredentials(
+                clearNetworkBackoff = true,
+                targetAccountId = accountId,
+                force = force,
+            )
+        }
         accountsFlow = MutableStateFlow(emptyList())
         settingsFlow = MutableStateFlow(AppSettings())
         callsFlow = MutableStateFlow(emptyList())
@@ -294,15 +300,78 @@ class App : Application() {
         }
     }
 
+    /**
+     * Re-verifies router credentials and SIP registration health when the UI returns to
+     * the foreground after long background or Doze periods.
+     */
+    fun onAppForegrounded() {
+        reloadFromStoreIfNeeded()
+        if (settingsFlow.value.backgroundService && accountsFlow.value.any { it.enabled }) {
+            CallService.start(this)
+        }
+        startNetworkWatcher()
+        triggerRecovery(clearNetworkBackoff = true, forceProbe = true, awaitCompletion = false)
+    }
+
+    /**
+     * Triggered by CallService's Doze-safe AlarmManager heartbeat to keep credentials and
+     * SIP registrations healthy across Deep Doze windows.
+     */
+    fun onKeepAliveHeartbeat(onFinished: (() -> Unit)? = null) {
+        triggerRecovery(
+            clearNetworkBackoff = false,
+            forceProbe = true,
+            awaitCompletion = true,
+            onFinished = onFinished,
+        )
+    }
+
+    private fun triggerRecovery(
+        clearNetworkBackoff: Boolean,
+        forceProbe: Boolean,
+        awaitCompletion: Boolean,
+        onFinished: (() -> Unit)? = null,
+    ) {
+        if (!engineStarted) {
+            onFinished?.invoke()
+            return
+        }
+        scope.launch {
+            try {
+                runRecoveryCheck(
+                    clearNetworkBackoff = clearNetworkBackoff,
+                    forceProbe = forceProbe,
+                    onNetworkChange = false,
+                    awaitCompletion = awaitCompletion,
+                )
+            } finally {
+                onFinished?.invoke()
+            }
+        }
+    }
+
+    private suspend fun runRecoveryCheck(
+        clearNetworkBackoff: Boolean,
+        forceProbe: Boolean,
+        onNetworkChange: Boolean,
+        awaitCompletion: Boolean = false,
+    ) {
+        reloadFromStoreIfNeeded()
+        if (accountsFlow.value.none { it.enabled }) return
+        refreshStaleCredentials(clearNetworkBackoff = clearNetworkBackoff)
+        when {
+            onNetworkChange -> engine.onNetworkChanged()
+            awaitCompletion -> engine.ensureHealthyRegistrationAndWait(forceProbe = forceProbe)
+            else -> engine.ensureHealthyRegistration(forceProbe = forceProbe)
+        }
+    }
+
     private fun scheduleNetworkRecovery() {
         networkRecoveryJob?.cancel()
         networkRecoveryJob = scope.launch {
             delay(450)
-            reloadFromStoreIfNeeded()
-            if (accountsFlow.value.none { it.enabled }) return@launch
             Log.i("JioCallApp", "Network state/link updated; verifying router credentials & SIP registration")
-            refreshStaleCredentials(clearNetworkBackoff = true)
-            engine.onNetworkChanged()
+            runRecoveryCheck(clearNetworkBackoff = true, forceProbe = false, onNetworkChange = true)
         }
     }
 
@@ -311,55 +380,72 @@ class App : Application() {
         refreshJob = scope.launch {
             while (isActive) {
                 refreshStaleCredentials(clearNetworkBackoff = false)
+                engine.ensureHealthyRegistration(forceProbe = true)
                 delay(60_000)
             }
         }
     }
 
-    private suspend fun refreshStaleCredentials(clearNetworkBackoff: Boolean) {
-        val settings = settingsFlow.value
-        if (!settings.autoRefreshRouter) return
-        val accounts = accountsFlow.value
-        val now = System.currentTimeMillis() / 1000
-        val statuses = engine.statuses.value
-        for (account in accounts) {
-            val provisioning = account.provisioning ?: continue
-            if (!account.enabled || !provisioning.autoRefresh) continue
-            val status = statuses[account.id]
-            val failed = status?.state == RegState.FAILED
-            val authFailed = failed && status?.reason?.contains("Authentication rejected", ignoreCase = true) == true
-            val shouldRenew = when (provisioning.mode) {
-                JioMode.TEMPORARY -> {
-                    val expired = provisioning.expiresAt?.let { it <= now } ?: false
-                    val expiring = provisioning.expiresAt?.let { it - now <= 60 } ?: false
-                    failed || expiring || expired
-                }
-                JioMode.PERMANENT -> authFailed
-            }
-            if (!shouldRenew) continue
+    private suspend fun refreshStaleCredentials(
+        clearNetworkBackoff: Boolean,
+        targetAccountId: Long? = null,
+        force: Boolean = false,
+    ) {
+        renewMutex.withLock {
+            val settings = settingsFlow.value
+            if (!force && !settings.autoRefreshRouter) return
+            val accounts = accountsFlow.value
+            val statuses = engine.statuses.value
+            for (account in accounts) {
+                if (targetAccountId != null && account.id != targetAccountId) continue
+                val provisioning = account.provisioning ?: continue
+                if (!account.enabled) continue
 
-            val nextAllowed = cooldownUntil[account.id] ?: 0L
-            if (clearNetworkBackoff && nextAllowed - now <= 20L) {
-                cooldownUntil.remove(account.id)
-            } else if (now < nextAllowed) {
-                continue
-            }
-
-            try {
-                val credentials = withContext(Dispatchers.IO) {
-                    jio.renewCredentials(provisioning.router, deviceName, provisioning.mode)
+                val now = System.currentTimeMillis() / 1000
+                val status = statuses[account.id]
+                val failed = status?.state == RegState.FAILED
+                val authRejected = failed && (
+                    status?.code in setOf(401, 403, 407) ||
+                        status?.reason?.contains("Authentication rejected", ignoreCase = true) == true ||
+                        status?.reason?.contains("403", ignoreCase = true) == true
+                    )
+                val expiredOrExpiring = provisioning.expiresAt?.let { it - now <= 120L } ?: false
+                val shouldRenew = when {
+                    force -> true
+                    provisioning.mode == JioMode.TEMPORARY ->
+                        provisioning.autoRefresh && (failed || expiredOrExpiring)
+                    else -> settings.autoRefreshRouter && authRejected
                 }
-                cooldownUntil[account.id] = now + 60L
-                val updated = JioRouter.applyCredentials(account, credentials, provisioning.router)
-                    .copy(provisioning = provisioning.copy(expiresAt = credentials.validity?.let { now + it }))
-                saveAccount(updated)
-            } catch (refused: JioException) {
-                Log.w("JioCallApp", "Router credential renewal refused for ${account.title()}: ${refused.message}")
-                cooldownUntil[account.id] = now + 300L
-            } catch (ioError: Exception) {
-                // Transient offline/Wi-Fi startup error: allow fast retry as soon as NetworkCallback fires.
-                Log.d("JioCallApp", "Router unreachable during renewal for ${account.title()}: ${ioError.message}")
-                cooldownUntil[account.id] = now + 10L
+                if (!shouldRenew) continue
+
+                val lastSuccess = lastRenewSuccessAt[account.id] ?: 0L
+                if (now - lastSuccess < 15L) continue
+
+                val nextAllowed = cooldownUntil[account.id] ?: 0L
+                if (clearNetworkBackoff && nextAllowed - now <= 20L) {
+                    cooldownUntil.remove(account.id)
+                } else if (!force && now < nextAllowed) {
+                    continue
+                }
+
+                try {
+                    val credentials = withContext(Dispatchers.IO) {
+                        jio.renewCredentials(provisioning.router, deviceName, provisioning.mode)
+                    }
+                    val completedAt = System.currentTimeMillis() / 1000
+                    lastRenewSuccessAt[account.id] = completedAt
+                    cooldownUntil[account.id] = completedAt + 60L
+                    val updated = JioRouter.applyCredentials(account, credentials, provisioning.router)
+                        .copy(provisioning = provisioning.copy(expiresAt = credentials.validity?.let { completedAt + it }))
+                    saveAccount(updated)
+                } catch (refused: JioException) {
+                    Log.w("JioCallApp", "Router credential renewal refused for ${account.title()}: ${refused.message}")
+                    cooldownUntil[account.id] = now + 300L
+                } catch (ioError: Exception) {
+                    // Transient offline/Wi-Fi startup error: allow fast retry as soon as NetworkCallback fires.
+                    Log.d("JioCallApp", "Router unreachable during renewal for ${account.title()}: ${ioError.message}")
+                    cooldownUntil[account.id] = now + 10L
+                }
             }
         }
     }

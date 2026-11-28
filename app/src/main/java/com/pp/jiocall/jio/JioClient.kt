@@ -23,10 +23,20 @@ class JioClient(private val context: Context) {
 
     /** This device's name, as the router and app know it. */
     fun hostname(): String {
-        return (context.applicationContext as? com.pp.jiocall.App)?.deviceName ?: run {
-            val model = Build.MODEL.trim()
-            val brand = Build.BRAND.replaceFirstChar { it.uppercase() }
-            if (model.startsWith(brand, ignoreCase = true)) model else "$brand $model"
+        return (context.applicationContext as? com.pp.jiocall.App)?.deviceName
+            ?: defaultDeviceName()
+    }
+
+    companion object {
+        internal fun defaultDeviceName(): String {
+            val model = runCatching { Build.MODEL.trim() }.getOrDefault("")
+            val brand = runCatching { Build.BRAND.trim() }.getOrDefault("")
+                .replaceFirstChar { it.uppercase() }
+            return when {
+                model.isEmpty() -> brand.ifEmpty { "Android" }
+                brand.isEmpty() || model.startsWith(brand, ignoreCase = true) -> model
+                else -> "$brand $model"
+            }
         }
     }
 

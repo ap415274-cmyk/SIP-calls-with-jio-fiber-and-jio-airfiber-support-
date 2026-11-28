@@ -1,12 +1,15 @@
 package com.pp.jiocall.sip
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
@@ -15,6 +18,8 @@ import android.graphics.Paint
 import android.graphics.Typeface
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -50,6 +55,30 @@ class CallService : Service() {
     private var cachedAvatarBitmap: Bitmap? = null
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var callJob: Job? = null
+    private var keepAliveScheduled = false
+    private var keepAliveReceiverRegistered = false
+    private var keepAliveWakeLock: PowerManager.WakeLock? = null
+
+    private val keepAliveReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ACTION_KEEPALIVE_HEARTBEAT) return
+            keepAliveScheduled = false
+            if (activeInstance !== this@CallService) return
+            scheduleNextKeepAliveAlarm()
+            runCatching {
+                acquireShortWakeLock()
+                val app = application as? App
+                if (app != null) {
+                    app.onKeepAliveHeartbeat { releaseShortWakeLock() }
+                } else {
+                    releaseShortWakeLock()
+                }
+            }.onFailure { err ->
+                releaseShortWakeLock()
+                Log.w("CallService", "Keep-alive heartbeat error: ${err.message}")
+            }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -57,6 +86,14 @@ class CallService : Service() {
         super.onCreate()
         activeInstance = this
         ensureChannels()
+        ContextCompat.registerReceiver(
+            this,
+            keepAliveReceiver,
+            IntentFilter(ACTION_KEEPALIVE_HEARTBEAT),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        keepAliveReceiverRegistered = true
+        scheduleNextKeepAliveAlarm()
         observeCall()
     }
 
@@ -134,8 +171,73 @@ class CallService : Service() {
     override fun onDestroy() {
         if (activeInstance === this) activeInstance = null
         callJob?.cancel()
+        cancelKeepAliveAlarm()
+        if (keepAliveReceiverRegistered) {
+            runCatching { unregisterReceiver(keepAliveReceiver) }
+            keepAliveReceiverRegistered = false
+        }
+        runCatching {
+            keepAliveWakeLock?.let { if (it.isHeld) it.release() }
+        }
         clearForegroundFlags()
         super.onDestroy()
+    }
+
+    private fun ensureKeepAliveAlarmScheduled() {
+        if (!keepAliveScheduled) scheduleNextKeepAliveAlarm()
+    }
+
+    private fun scheduleNextKeepAliveAlarm() {
+        runCatching {
+            val alarmManager = getSystemService(AlarmManager::class.java) ?: return
+            val triggerAt = SystemClock.elapsedRealtime() + KEEPALIVE_INTERVAL_MS
+            alarmManager.setAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                triggerAt,
+                keepAlivePendingIntent(),
+            )
+            keepAliveScheduled = true
+        }.onFailure { err ->
+            Log.w("CallService", "Failed to schedule keep-alive alarm: ${err.message}")
+        }
+    }
+
+    private fun cancelKeepAliveAlarm() {
+        keepAliveScheduled = false
+        runCatching {
+            val alarmManager = getSystemService(AlarmManager::class.java) ?: return
+            alarmManager.cancel(keepAlivePendingIntent())
+        }
+    }
+
+    private fun keepAlivePendingIntent(): PendingIntent {
+        val intent = Intent(ACTION_KEEPALIVE_HEARTBEAT).setPackage(packageName)
+        return PendingIntent.getBroadcast(
+            this,
+            KEEPALIVE_REQUEST_CODE,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    private fun acquireShortWakeLock() {
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        val wl = keepAliveWakeLock ?: pm.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "JioCall::KeepAliveHeartbeat",
+        ).apply {
+            setReferenceCounted(false)
+            keepAliveWakeLock = this
+        }
+        if (!wl.isHeld) {
+            wl.acquire(KEEPALIVE_WAKELOCK_MS)
+        }
+    }
+
+    private fun releaseShortWakeLock() {
+        runCatching {
+            keepAliveWakeLock?.let { if (it.isHeld) it.release() }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -307,7 +409,10 @@ class CallService : Service() {
         val notif = when (mode) {
             MODE_INCOMING -> incomingNotification(title)
             MODE_ONGOING -> ongoingNotification(title, text, startedAt, isMuted, isSpeaker)
-            else -> statusNotification(title, text)
+            else -> {
+                ensureKeepAliveAlarmScheduled()
+                statusNotification(title, text)
+            }
         }
 
         val targetId = if (mode == MODE_STATUS) STATUS_NOTIFICATION_ID else CALL_NOTIFICATION_ID
@@ -681,6 +786,10 @@ class CallService : Service() {
         const val ACTION_TOGGLE_MUTE = "com.pp.jiocall.TOGGLE_MUTE"
         const val ACTION_TOGGLE_SPEAKER = "com.pp.jiocall.TOGGLE_SPEAKER"
         const val ACTION_START = "com.pp.jiocall.START"
+        const val ACTION_KEEPALIVE_HEARTBEAT = "com.pp.jiocall.KEEPALIVE_HEARTBEAT"
+        private const val KEEPALIVE_INTERVAL_MS = 15 * 60_000L
+        private const val KEEPALIVE_WAKELOCK_MS = 20_000L
+        private const val KEEPALIVE_REQUEST_CODE = 1099
 
         private val micFgsLock = Object()
         @Volatile
