@@ -36,7 +36,7 @@
 
 ## Download & Install
 
-1. Download the signed release APK from [**GitHub Releases**](https://github.com/ap415274-cmyk/JioCall/releases/latest) (or directly from [`releases/JioCall-v1.2-release.apk`](releases/JioCall-v1.2-release.apk)).
+1. Download the signed release APK from [**GitHub Releases**](https://github.com/ap415274-cmyk/JioCall/releases/latest) (or directly from [`releases/JioCall-v1.3-release.apk`](releases/JioCall-v1.3-release.apk)).
 2. Install on Android **9.0 (API 28)** or newer.
 3. Connect to your **JioFiber / JioAirFiber** Wi-Fi network, open the app menu -> **Connect JioFiber/AirFiber**, and choose:
    - **Temporary (`eth`)**: Instant setup with no OTP (credentials auto-renew when needed).
