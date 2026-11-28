@@ -52,7 +52,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -126,21 +127,9 @@ fun CallScreen(
     val haptic = LocalHapticFeedback.current
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
-    var elapsedSeconds by remember(call.callId, call.startedAt) {
-        mutableLongStateOf(
-            if (call.startedAt > 0) ((System.currentTimeMillis() - call.startedAt) / 1000L).coerceAtLeast(0L) else 0L,
-        )
-    }
 
     BackHandler(enabled = showKeypad) {
         showKeypad = false
-    }
-
-    LaunchedEffect(call.startedAt, call.state) {
-        while (call.state == CallState.ACTIVE || call.state == CallState.HELD) {
-            elapsedSeconds = if (call.startedAt > 0) (System.currentTimeMillis() - call.startedAt) / 1000 else 0
-            delay(1_000)
-        }
     }
 
     val formattedNumber = remember(call.number) {
@@ -151,24 +140,19 @@ fun CallScreen(
     val isCallActive = call.answered && call.state == CallState.ACTIVE
     val showControls = call.answered || (call.outgoing && (call.state == CallState.DIALING || call.state == CallState.RINGING))
 
-    val glowColor = when {
-        isIncomingRinging -> Color(0x2834A853)
-        call.state == CallState.HELD -> Color(0x24FFB74D)
-        call.state == CallState.ACTIVE -> Color(0x1E1B72E8)
-        call.state == CallState.FAILED -> Color(0x24E53935)
-        else -> Color(0x1C8AB4F8)
+    val topGlowColor = when {
+        isIncomingRinging -> Color(0x3234A853)
+        call.state == CallState.HELD -> Color(0x34FFB74D)
+        call.state == CallState.FAILED -> Color(0x36E53935)
+        call.state == CallState.ENDED -> Color(0x2664748B)
+        else -> Color(0x483B82F6)
     }
-    val screenBgBrush = remember {
-        Brush.verticalGradient(
-            colors = listOf(
-                Color(0xFF171C24),
-                Color(0xFF0E1117),
-                Color(0xFF080A0E),
-            ),
-        )
-    }
-    val ambientGlowBrush = remember(glowColor) {
-        Brush.radialGradient(colors = listOf(glowColor, Color.Transparent))
+    val bottomGlowColor = when {
+        isIncomingRinging -> Color(0x181B5E20)
+        call.state == CallState.HELD -> Color(0x24FB923C)
+        call.state == CallState.FAILED -> Color(0x22DC2626)
+        call.state == CallState.ENDED -> Color(0x18475569)
+        else -> Color(0x346366F1)
     }
 
     val backdropInteraction = remember { MutableInteractionSource() }
@@ -179,12 +163,40 @@ fun CallScreen(
                 focusManager.clearFocus(force = true)
                 keyboardController?.hide()
             }
-            .drawBehind {
-                drawRect(screenBgBrush)
-                drawRect(
-                    brush = ambientGlowBrush,
-                    size = androidx.compose.ui.geometry.Size(size.width, size.height * 0.48f),
+            .drawWithCache {
+                val baseBrush = if (isIncomingRinging) {
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0xFF131B24),
+                            Color(0xFF0C1118),
+                            Color(0xFF070A0E),
+                        ),
+                    )
+                } else {
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0xFF14213D),
+                            Color(0xFF0E172E),
+                            Color(0xFF090E1C),
+                        ),
+                    )
+                }
+                // Full-bleed unclipped radial glows avoid hard mid-screen horizontal seams.
+                val upperOrb = Brush.radialGradient(
+                    colors = listOf(topGlowColor, Color.Transparent),
+                    center = Offset(size.width * 0.56f, size.height * 0.24f),
+                    radius = size.maxDimension * 0.68f,
                 )
+                val lowerOrb = Brush.radialGradient(
+                    colors = listOf(bottomGlowColor, Color.Transparent),
+                    center = Offset(size.width * 0.28f, size.height * 0.76f),
+                    radius = size.maxDimension * 0.76f,
+                )
+                onDrawBehind {
+                    drawRect(baseBrush)
+                    drawRect(upperOrb)
+                    drawRect(lowerOrb)
+                }
             },
     ) {
         // --- 1. Main In-Call Content ---
@@ -193,14 +205,14 @@ fun CallScreen(
                 .fillMaxSize()
                 .statusBarsPadding()
                 .navigationBarsPadding()
-                .padding(horizontal = 24.dp),
+                .padding(horizontal = 20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             // Top Bar: Minimize button + Account Pill
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(56.dp),
+                    .height(52.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
@@ -209,8 +221,8 @@ fun CallScreen(
                         modifier = Modifier
                             .size(42.dp)
                             .clip(CircleShape)
-                            .background(Color(0xFF222630))
-                            .border(1.dp, Color(0xFF323846), CircleShape)
+                            .background(Color(0x1EFFFFFF))
+                            .border(1.dp, Color(0x30FFFFFF), CircleShape)
                             .clickable {
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 onMinimize()
@@ -233,8 +245,8 @@ fun CallScreen(
                     Row(
                         modifier = Modifier
                             .clip(RoundedCornerShape(16.dp))
-                            .background(Color(0xFF1E222A))
-                            .border(1.dp, Color(0xFF2E3442), RoundedCornerShape(16.dp))
+                            .background(Color(0x1CFFFFFF))
+                            .border(1.dp, Color(0x2EFFFFFF), RoundedCornerShape(16.dp))
                             .padding(horizontal = 14.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -248,7 +260,7 @@ fun CallScreen(
                         Text(
                             text = call.accountTitle,
                             style = MaterialTheme.typography.labelMedium,
-                            color = Color(0xFFC4C7C5),
+                            color = Color(0xFFE2E8F0),
                             fontWeight = FontWeight.Medium,
                         )
                     }
@@ -259,11 +271,11 @@ fun CallScreen(
                 Spacer(Modifier.size(42.dp))
             }
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(10.dp))
 
             // Contact Avatar with single GPU-composited sonar halo on incoming calls
             Box(
-                modifier = Modifier.size(160.dp),
+                modifier = Modifier.size(if (isIncomingRinging) 160.dp else 116.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 if (isIncomingRinging) {
@@ -272,22 +284,23 @@ fun CallScreen(
                     )
                 }
 
+                val avatarSize = if (isIncomingRinging) 112.dp else 102.dp
                 Box(
                     modifier = Modifier
-                        .size(112.dp)
+                        .size(avatarSize)
                         .clip(CircleShape)
-                        .border(2.dp, if (isIncomingRinging) Color(0x8834A853) else Color(0x38FFFFFF), CircleShape),
+                        .border(2.dp, if (isIncomingRinging) Color(0x8834A853) else Color(0x45FFFFFF), CircleShape),
                     contentAlignment = Alignment.Center,
                 ) {
                     ContactAvatar(
                         name = callerDisplayName,
                         photoUri = photoUri,
-                        size = 112.dp,
+                        size = avatarSize,
                     )
                 }
             }
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(14.dp))
 
             // Caller Name
             Text(
@@ -306,66 +319,22 @@ fun CallScreen(
                 Text(
                     text = formattedNumber,
                     fontSize = 15.sp,
-                    color = Color(0xFF9AA0A6),
+                    color = Color(0xFFB6C2D6),
                     textAlign = TextAlign.Center,
                 )
             }
 
             Spacer(Modifier.height(10.dp))
 
-            // Call Status / Elapsed Timer Row
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
-            ) {
-                if (isCallActive) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xFF34A853)),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                }
-
-                val statusText = when (call.state) {
-                    CallState.DIALING -> "Calling…"
-                    CallState.RINGING -> if (call.outgoing) "Ringing…" else "Incoming call"
-                    CallState.HELD -> "Call on hold"
-                    CallState.ACTIVE -> {
-                        val m = elapsedSeconds / 60
-                        val s = elapsedSeconds % 60
-                        String.format(java.util.Locale.US, "%02d:%02d", m, s)
-                    }
-                    CallState.ENDED -> "Call ended"
-                    CallState.FAILED -> call.error ?: "Call failed"
-                }
-
-                val statusColor = when (call.state) {
-                    CallState.ACTIVE -> Color(0xFFE8EAED)
-                    CallState.HELD -> Color(0xFFFFB74D)
-                    CallState.FAILED -> Color(0xFFF28B82)
-                    CallState.ENDED -> Color(0xFF9AA0A6)
-                    else -> Color(0xFF8AB4F8)
-                }
-
-                Text(
-                    text = statusText,
-                    fontSize = 16.sp,
-                    fontWeight = if (isCallActive) FontWeight.Medium else FontWeight.Normal,
-                    color = statusColor,
-                )
-
-                // Optional HD Voice Pill (observes live quality locally without recomposing CallScreen)
-                CallCodecBadge(
-                    isCallActive = isCallActive,
-                    fallback = call.quality,
-                    qualityFlow = qualityFlow,
-                )
-            }
+            // Call Status / 1Hz Isolated Elapsed Timer + Codec Badge Row
+            CallStatusRow(
+                call = call,
+                isCallActive = isCallActive,
+                qualityFlow = qualityFlow,
+            )
 
             if (secondaryCall != null) {
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(14.dp))
                 SecondaryCallBanner(
                     other = secondaryCall,
                     onAnswerWaiting = onAnswerWaiting,
@@ -376,7 +345,7 @@ fun CallScreen(
 
             Spacer(Modifier.weight(1f))
 
-            // Smooth crossfade between Incoming Ringing pills and In-Call 2x3 action grid
+            // Smooth crossfade between Incoming Ringing pills and One UI / iOS Frosted Glass Panel
             AnimatedContent(
                 targetState = isIncomingRinging to showControls,
                 transitionSpec = {
@@ -394,8 +363,8 @@ fun CallScreen(
                             Box(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(22.dp))
-                                    .background(if (ringerSilenced) Color(0xFF262B36) else Color(0xFF1D222C))
-                                    .border(1.dp, Color(0xFF313847), RoundedCornerShape(22.dp))
+                                    .background(if (ringerSilenced) Color(0x28FFFFFF) else Color(0x1CFFFFFF))
+                                    .border(1.dp, Color(0x32FFFFFF), RoundedCornerShape(22.dp))
                                     .clickable(
                                         enabled = !ringerSilenced,
                                         interactionSource = remember { MutableInteractionSource() },
@@ -412,17 +381,17 @@ fun CallScreen(
                                     text = if (ringerSilenced) "Ringer silenced" else "Silence ringer",
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.Medium,
-                                    color = if (ringerSilenced) Color(0xFF9AA0A6) else Color(0xFFE8EAED),
+                                    color = if (ringerSilenced) Color(0xFFAAB4C4) else Color(0xFFF1F5F9),
                                 )
                             }
 
                             Box(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(22.dp))
-                                    .background(if (speakerOn) Color(0xFF223B5F) else Color(0xFF1D222C))
+                                    .background(if (speakerOn) Color(0x383B82F6) else Color(0x1CFFFFFF))
                                     .border(
                                         1.dp,
-                                        if (speakerOn) Color(0xFF8AB4F8) else Color(0xFF313847),
+                                        if (speakerOn) Color(0x8893C5FD) else Color(0x32FFFFFF),
                                         RoundedCornerShape(22.dp),
                                     )
                                     .clickable(
@@ -439,7 +408,7 @@ fun CallScreen(
                                     Icon(
                                         painter = painterResource(R.drawable.ic_volume_up),
                                         contentDescription = null,
-                                        tint = if (speakerOn) Color(0xFF8AB4F8) else Color(0xFFE8EAED),
+                                        tint = if (speakerOn) Color(0xFF93C5FD) else Color(0xFFF1F5F9),
                                         modifier = Modifier.size(16.dp),
                                     )
                                     Spacer(Modifier.width(6.dp))
@@ -447,7 +416,7 @@ fun CallScreen(
                                         text = if (speakerOn) "Speaker on" else "Speaker",
                                         fontSize = 13.sp,
                                         fontWeight = FontWeight.Medium,
-                                        color = if (speakerOn) Color(0xFF8AB4F8) else Color(0xFFE8EAED),
+                                        color = if (speakerOn) Color(0xFF93C5FD) else Color(0xFFF1F5F9),
                                     )
                                 }
                             }
@@ -455,116 +424,65 @@ fun CallScreen(
                         Spacer(Modifier.height(10.dp))
                     }
                 } else if (controlsVisible) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalArrangement = Arrangement.spacedBy(16.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            // Row 1: Mute | Keypad | Speaker
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceEvenly,
-                            ) {
-                                CallActionButton(
-                                    icon = painterResource(if (call.muted) R.drawable.ic_mic_off else R.drawable.ic_mic),
-                                    label = if (call.muted) "Muted" else "Mute",
-                                    active = call.muted,
-                                    onClick = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        onMute()
-                                    },
-                                )
-                                CallActionButton(
-                                    icon = painterResource(R.drawable.ic_dialpad),
-                                    label = "Keypad",
-                                    active = false,
-                                    onClick = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        showKeypad = true
-                                    },
-                                )
-                                CallActionButton(
-                                    icon = painterResource(R.drawable.ic_volume_up),
-                                    label = if (speakerOn) "Speaker on" else "Speaker",
-                                    active = speakerOn,
-                                    activeColor = Color(0xFF8AB4F8),
-                                    activeContentColor = Color(0xFF0A1E3D),
-                                    onClick = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        onSpeaker()
-                                    },
-                                )
-                            }
-
-                            // Row 2: Hold | Record | Contacts
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceEvenly,
-                            ) {
-                                CallActionButton(
-                                    icon = painterResource(if (call.onHold) R.drawable.ic_play_arrow else R.drawable.ic_pause),
-                                    label = if (call.onHold) "Unhold" else "Hold",
-                                    active = call.onHold,
-                                    onClick = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        onHold()
-                                    },
-                                )
-                                CallActionButton(
-                                    icon = painterResource(R.drawable.ic_record),
-                                    label = if (call.recording) "Recording" else "Record",
-                                    active = call.recording,
-                                    activeColor = Color(0xFFD93025),
-                                    activeContentColor = Color.White,
-                                    onClick = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        onRecord()
-                                    },
-                                )
-                                CallActionButton(
-                                    icon = painterResource(R.drawable.ic_person),
-                                    label = "Contacts",
-                                    active = false,
-                                    onClick = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        (onOpenContacts ?: onMinimize)?.invoke()
-                                    },
-                                )
-                            }
-                        }
-                        Spacer(Modifier.height(36.dp))
-                    }
+                    CallControlsGlassPanel(
+                        call = call,
+                        speakerOn = speakerOn,
+                        onMute = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onMute()
+                        },
+                        onKeypad = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            showKeypad = true
+                        },
+                        onSpeaker = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onSpeaker()
+                        },
+                        onHold = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onHold()
+                        },
+                        onRecord = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onRecord()
+                        },
+                        onContacts = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            (onOpenContacts ?: onMinimize)?.invoke()
+                        },
+                        onHangup = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onHangup()
+                        },
+                        modifier = Modifier.padding(bottom = 16.dp),
+                    )
                 } else {
-                    Spacer(Modifier.height(12.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 28.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CallFabButton(
+                            icon = painterResource(R.drawable.ic_call_end),
+                            backgroundColor = Color(0xFFE53935),
+                            contentDescription = "End Call",
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                onHangup()
+                            },
+                        )
+                    }
                 }
             }
 
-            // Bottom Actions: Dual Zero-Lag Sliding Handles (Incoming) or Centered End Call FAB (Active/Dialing)
             if (isIncomingRinging) {
                 androidx.compose.runtime.key(call.callId) {
                     IncomingSlideControlBar(
                         onDecline = onHangup,
                         onAnswer = onAnswer,
                         modifier = Modifier.padding(bottom = 18.dp),
-                    )
-                }
-            } else {
-                // Active / Dialing / Outgoing: Centered Large Crimson Red End Call FAB
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 28.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    CallFabButton(
-                        icon = painterResource(R.drawable.ic_call_end),
-                        backgroundColor = Color(0xFFE53935),
-                        contentDescription = "End Call",
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            onHangup()
-                        },
                     )
                 }
             }
@@ -584,7 +502,7 @@ fun CallScreen(
         ) {
             val keypadBackdropInteraction = remember { MutableInteractionSource() }
             Surface(
-                color = Color(0xFF13161C),
+                color = Color(0xEC091020),
                 modifier = Modifier
                     .fillMaxSize()
                     .clickable(interactionSource = keypadBackdropInteraction, indication = null) {
@@ -616,7 +534,8 @@ fun CallScreen(
                             modifier = Modifier
                                 .size(42.dp)
                                 .clip(CircleShape)
-                                .background(Color(0xFF222630)),
+                                .background(Color(0x1CFFFFFF))
+                                .border(1.dp, Color(0x2EFFFFFF), CircleShape),
                         ) {
                             Icon(
                                 painter = painterResource(R.drawable.ic_keyboard_arrow_down),
@@ -717,8 +636,8 @@ fun CallScreen(
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(24.dp))
-                                .background(Color(0xFF222630))
-                                .border(1.dp, Color(0xFF333844), RoundedCornerShape(24.dp))
+                                .background(Color(0x1CFFFFFF))
+                                .border(1.dp, Color(0x2EFFFFFF), RoundedCornerShape(24.dp))
                                 .clickable {
                                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                     showKeypad = false
@@ -754,15 +673,205 @@ fun CallScreen(
 }
 
 /**
- * Standard Phone Circular Action Button (Mute, Speaker, Keypad, Hold, Record).
+ * Isolated 1Hz status/timer row so elapsed-second ticks never recompose the backdrop or control panel.
+ */
+@Composable
+private fun CallStatusRow(
+    call: CallSnapshot,
+    isCallActive: Boolean,
+    qualityFlow: StateFlow<CallQuality?>?,
+) {
+    var elapsedSeconds by remember(call.callId, call.startedAt) {
+        mutableLongStateOf(
+            if (call.startedAt > 0) ((System.currentTimeMillis() - call.startedAt) / 1000L).coerceAtLeast(0L) else 0L,
+        )
+    }
+    LaunchedEffect(call.startedAt, call.state) {
+        while (call.state == CallState.ACTIVE || call.state == CallState.HELD) {
+            elapsedSeconds = if (call.startedAt > 0) (System.currentTimeMillis() - call.startedAt) / 1000 else 0
+            delay(1_000)
+        }
+    }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        if (isCallActive) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFF34A853)),
+            )
+            Spacer(Modifier.width(8.dp))
+        }
+
+        val statusText = when (call.state) {
+            CallState.DIALING -> "Calling…"
+            CallState.RINGING -> if (call.outgoing) "Ringing…" else "Incoming call"
+            CallState.HELD -> "Call on hold"
+            CallState.ACTIVE -> {
+                val m = elapsedSeconds / 60
+                val s = elapsedSeconds % 60
+                String.format(java.util.Locale.US, "%02d:%02d", m, s)
+            }
+            CallState.ENDED -> "Call ended"
+            CallState.FAILED -> call.error ?: "Call failed"
+        }
+
+        val statusColor = when (call.state) {
+            CallState.ACTIVE -> Color(0xFFF1F5F9)
+            CallState.HELD -> Color(0xFFFFB74D)
+            CallState.FAILED -> Color(0xFFF28B82)
+            CallState.ENDED -> Color(0xFFAAB4C4)
+            else -> Color(0xFF93C5FD)
+        }
+
+        Text(
+            text = statusText,
+            fontSize = 16.sp,
+            fontWeight = if (isCallActive) FontWeight.Medium else FontWeight.Normal,
+            color = statusColor,
+        )
+
+        CallCodecBadge(
+            isCallActive = isCallActive,
+            fallback = call.quality,
+            qualityFlow = qualityFlow,
+        )
+    }
+}
+
+/**
+ * Floating One UI / iOS style translucent frosted-glass control card with static cached brushes
+ * so active call screens incur zero real-time blur or per-frame shader overhead.
+ */
+@Composable
+private fun CallControlsGlassPanel(
+    call: CallSnapshot,
+    speakerOn: Boolean,
+    onMute: () -> Unit,
+    onKeypad: () -> Unit,
+    onSpeaker: () -> Unit,
+    onHold: () -> Unit,
+    onRecord: () -> Unit,
+    onContacts: () -> Unit,
+    onHangup: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val glassFill = remember {
+        Brush.verticalGradient(
+            colors = listOf(
+                Color(0x28FFFFFF),
+                Color(0x18D8E6FF),
+                Color(0x1299B6F2),
+            ),
+        )
+    }
+    val glassBorder = remember {
+        Brush.verticalGradient(
+            colors = listOf(
+                Color(0x48FFFFFF),
+                Color(0x1CFFFFFF),
+                Color(0x2AFFFFFF),
+            ),
+        )
+    }
+    val panelShape = remember { RoundedCornerShape(32.dp) }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(panelShape)
+            .background(glassFill)
+            .border(1.dp, glassBorder, panelShape)
+            .padding(horizontal = 16.dp, vertical = 22.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            // Row 1: Mute | Keypad | Speaker
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+            ) {
+                CallActionButton(
+                    icon = painterResource(if (call.muted) R.drawable.ic_mic_off else R.drawable.ic_mic),
+                    label = if (call.muted) "Muted" else "Mute",
+                    active = call.muted,
+                    onClick = onMute,
+                )
+                CallActionButton(
+                    icon = painterResource(R.drawable.ic_dialpad),
+                    label = "Keypad",
+                    active = false,
+                    onClick = onKeypad,
+                )
+                CallActionButton(
+                    icon = painterResource(R.drawable.ic_volume_up),
+                    label = if (speakerOn) "Speaker on" else "Speaker",
+                    active = speakerOn,
+                    activeColor = Color(0xFF93C5FD),
+                    activeContentColor = Color(0xFF0A1E3D),
+                    onClick = onSpeaker,
+                )
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // Row 2: Hold | Record | Contacts
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+            ) {
+                CallActionButton(
+                    icon = painterResource(if (call.onHold) R.drawable.ic_play_arrow else R.drawable.ic_pause),
+                    label = if (call.onHold) "Unhold" else "Hold",
+                    active = call.onHold,
+                    onClick = onHold,
+                )
+                CallActionButton(
+                    icon = painterResource(R.drawable.ic_record),
+                    label = if (call.recording) "Recording" else "Record",
+                    active = call.recording,
+                    activeColor = Color(0xFFD93025),
+                    activeContentColor = Color.White,
+                    onClick = onRecord,
+                )
+                CallActionButton(
+                    icon = painterResource(R.drawable.ic_person),
+                    label = "Contacts",
+                    active = false,
+                    onClick = onContacts,
+                )
+            }
+
+            Spacer(Modifier.height(22.dp))
+
+            CallFabButton(
+                icon = painterResource(R.drawable.ic_call_end),
+                backgroundColor = Color(0xFFE53935),
+                contentDescription = "End Call",
+                size = 70.dp,
+                iconSize = 32.dp,
+                onClick = onHangup,
+            )
+        }
+    }
+}
+
+/**
+ * Standard Phone Circular Action Button inside the frosted-glass panel (Mute, Speaker, Keypad, Hold, Record).
  */
 @Composable
 private fun CallActionButton(
     icon: Painter,
     label: String,
     active: Boolean,
-    activeColor: Color = Color(0xFFE8EAED),
-    activeContentColor: Color = Color(0xFF1F2228),
+    activeColor: Color = Color(0xFFF1F5F9),
+    activeContentColor: Color = Color(0xFF0F172A),
     onClick: () -> Unit,
 ) {
     val interaction = remember { MutableInteractionSource() }
@@ -776,10 +885,10 @@ private fun CallActionButton(
     val containerColor by transition.animateColor(
         transitionSpec = { tween(180) },
         label = "actionBg",
-    ) { isActive -> if (isActive) activeColor else Color(0xFF222630) }
-    val iconColor = if (active) activeContentColor else Color(0xFFE8EAED)
-    val borderColor = if (active) activeColor else Color(0xFF323846)
-    val textColor = if (active) Color.White else Color(0xFF9AA0A6)
+    ) { isActive -> if (isActive) activeColor else Color(0x18FFFFFF) }
+    val iconColor = if (active) activeContentColor else Color(0xFFF8FAFC)
+    val borderColor = if (active) activeColor else Color(0x28FFFFFF)
+    val textColor = if (active) Color.White else Color(0xFFD8E2F2)
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -787,7 +896,7 @@ private fun CallActionButton(
     ) {
         Box(
             modifier = Modifier
-                .size(62.dp)
+                .size(58.dp)
                 .graphicsLayer {
                     scaleX = scale
                     scaleY = scale
@@ -802,15 +911,15 @@ private fun CallActionButton(
                 painter = icon,
                 contentDescription = label,
                 tint = iconColor,
-                modifier = Modifier.size(26.dp),
+                modifier = Modifier.size(25.dp),
             )
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(7.dp))
         Text(
             text = label,
             fontSize = 12.sp,
             color = textColor,
-            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
             textAlign = TextAlign.Center,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -872,8 +981,8 @@ private fun KeypadDialButton(
         modifier = Modifier
             .size(width = 86.dp, height = 62.dp)
             .clip(RoundedCornerShape(31.dp))
-            .background(Color(0xFF222630))
-            .border(1.dp, Color(0xFF333946), RoundedCornerShape(31.dp))
+            .background(Color(0x18FFFFFF))
+            .border(1.dp, Color(0x28FFFFFF), RoundedCornerShape(31.dp))
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = ripple(bounded = true, color = Color(0xFF8AB4F8)),
@@ -916,8 +1025,8 @@ private fun SecondaryCallBanner(
             .fillMaxWidth()
             .padding(horizontal = 4.dp)
             .clip(RoundedCornerShape(20.dp))
-            .background(Color(0xFF1A202C))
-            .border(1.dp, Color(0xFF2D3748), RoundedCornerShape(20.dp))
+            .background(Color(0x1EFFFFFF))
+            .border(1.dp, Color(0x30FFFFFF), RoundedCornerShape(20.dp))
             .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1016,8 +1125,8 @@ private fun CallCodecBadge(
         Box(
             modifier = Modifier
                 .clip(RoundedCornerShape(8.dp))
-                .background(Color(0xFF1E2632))
-                .border(1.dp, Color(0xFF2E3E52), RoundedCornerShape(8.dp))
+                .background(Color(0x1CFFFFFF))
+                .border(1.dp, Color(0x30FFFFFF), RoundedCornerShape(8.dp))
                 .padding(horizontal = 8.dp, vertical = 2.dp),
         ) {
             Text(
