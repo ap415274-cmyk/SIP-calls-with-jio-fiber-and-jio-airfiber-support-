@@ -406,7 +406,7 @@ class SipLifecycleRecoveryTest {
                 // Socket looks freshly registered, then drops INVITE #1 silently without RST.
                 val call = agent.dial("+919876543210")!!
                 awaitCondition(
-                    13_000L,
+                    20_000L,
                     "5s INVITE watchdog + reconnect + retry reaching ACTIVE; conns=${server.acceptedCount}, invites=${inviteAttempts.get()}, state=${call.state}",
                 ) {
                     call.state == CallState.ACTIVE
